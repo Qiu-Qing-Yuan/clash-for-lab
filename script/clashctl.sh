@@ -1138,7 +1138,8 @@ function clashsubscribe() {
         cat <<EOF
 用法: clash subscribe [URL]
     无参数      显示当前订阅地址
-    URL         设置新的订阅地址
+    URL         设置新的订阅地址，请用单引号包住完整地址
+示例: clash subscribe 'https://example.com/sub?token=...&client=mihomo'
 EOF
         return 1
         ;;
@@ -1270,7 +1271,7 @@ _clashupdate_apply_locked() (
     }
     if [ "$explicit_url" != true ]; then
         url=$(_read_subscription_url_snapshot "$MIHOMO_CONFIG_URL") || {
-            _failcat '已保存的订阅地址无效，请重新执行 clash subscribe URL' || true
+            _failcat "已保存的订阅地址无效，请重新执行 clash subscribe '完整订阅地址'" || true
             return 1
         }
     fi
@@ -1410,7 +1411,7 @@ function clashupdate() {
     }
     if [ "$explicit_url" = false ] &&
         [ ! -f "$MIHOMO_CONFIG_URL" ]; then
-        _failcat '未设置有效的订阅地址，请先执行 clash subscribe URL'
+        _failcat "未设置有效的订阅地址，请先执行 clash subscribe '完整订阅地址'"
         return 1
     fi
 

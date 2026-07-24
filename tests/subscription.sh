@@ -134,13 +134,23 @@ if _is_valid_subscription_url 'https://example.com/sub token'; then
     fail 'URL containing whitespace was accepted'
 fi
 
-# subscribe saves through one locked atomic replacement and does not expose the
-# token in the success message or any product log.
+# A quoted long URL containing shell metacharacters is saved and displayed
+# byte-for-byte through one locked atomic replacement.
 reset_fixture
-printf 'n\n' | clashsubscribe 'https://new.example/sub?token=NEW_TOKEN' >/dev/null ||
+long_token=$(awk 'BEGIN { for (i = 0; i < 8192; i++) printf "x" }')
+long_url="https://new.example/sub?token=${long_token}&client=mihomo"
+printf 'n\n' | clashsubscribe "$long_url" >/dev/null ||
     fail 'subscribe failed'
-[ "$(cat "$MIHOMO_CONFIG_URL")" = 'https://new.example/sub?token=NEW_TOKEN' ] ||
+[ "$(cat "$MIHOMO_CONFIG_URL")" = "$long_url" ] ||
     fail 'subscribe did not save the URL'
+(
+    _okcat() { printf '%s\n' "$*"; }
+    clashsubscribe
+) > "$test_root/subscription-display" ||
+    fail 'subscribe did not display the saved URL'
+subscription_display=$(cat "$test_root/subscription-display")
+[ "$subscription_display" = "当前订阅地址: $long_url" ] ||
+    fail 'subscribe truncated the displayed URL'
 [ "$(mode_of "$MIHOMO_CONFIG_URL")" = 600 ] || fail 'saved URL mode is not 600'
 [ "$(grep -c '^lock:_clashsubscribe_set_locked$' "$trace")" -eq 1 ] ||
     fail 'subscribe did not use exactly one lifecycle lock'

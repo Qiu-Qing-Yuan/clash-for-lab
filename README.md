@@ -84,7 +84,7 @@ bash install.sh
 - 将管理 API 和 DNS 限制在本机，并为管理 API 生成独立的 64 个十六进制字符随机密钥
 - 启动 mihomo；任一步失败都会清理本次产生的半安装目录
 
-安装完成后重新登录，或手动重新加载当前 Shell 的 RC 文件。以后更换订阅可使用 `clash subscribe URL`，启动和停止分别使用 `clash on`、`clash off`。
+安装完成后重新登录，或手动重新加载当前 Shell 的 RC 文件。以后更换订阅可使用 `clash subscribe '完整订阅地址'`，启动和停止分别使用 `clash on`、`clash off`。
 
 ### 验证安装
 
@@ -251,7 +251,7 @@ ssh -L 9090:127.0.0.1:9090 user@server
 
 ```bash
 # 设置订阅地址
-clash subscribe https://your-subscription-url
+clash subscribe 'https://your-subscription-url'
 
 # 查看当前订阅
 clash subscribe
@@ -259,6 +259,8 @@ clash subscribe
 # 更新订阅配置
 clash update
 ```
+
+订阅地址通常包含 `&` 等 Shell 特殊字符，请始终用单引号包住完整地址，否则 Shell 可能在脚本收到地址前将其截断。
 
 本项目不会自动改写用户的整份 `crontab`。这样可以避免与备份、证书续期等外部定时任务并发时丢失用户数据。
 如果旧版本曾通过 `clash update auto` 创建 `mihomoctl_auto_update` 条目，请使用 `crontab -e` 手动删除；
@@ -401,7 +403,7 @@ A: 不建议。每个用户建议只运行一个实例，避免端口冲突和�
 
 ### Q: 如何更换订阅地址？
 
-A: 使用 `clash subscribe new-url` 保存新地址，然后按提示立即更新，或稍后执行 `clash update`。
+A: 使用 `clash subscribe 'new-url'` 保存新地址，然后按提示立即更新，或稍后执行 `clash update`。单引号可以防止 Shell 解析地址中的 `&` 等特殊字符。
 
 ### Q: 如何更新 mihomo 内核？
 
