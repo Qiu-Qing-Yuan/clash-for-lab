@@ -1,37 +1,48 @@
 # shellcheck disable=SC2148
 # shellcheck disable=SC2155
 
-_set_system_proxy() {
-    # Ensure config files exist before reading
-    [ ! -f "$MIHOMO_CONFIG_RUNTIME" ] && {
-        _failcat "运行时配置文件不存在: $MIHOMO_CONFIG_RUNTIME"
-        return 1
-    }
-    
-    local auth=$("$BIN_YQ" '.authentication[0] // ""' "$MIHOMO_CONFIG_RUNTIME" 2>/dev/null)
-    [ -n "$auth" ] && auth=$auth@
-
+_apply_system_proxy_environment() {
+    local auth=$1
     local http_proxy_addr="http://${auth}127.0.0.1:${MIXED_PORT}"
     local socks_proxy_addr="socks5h://${auth}127.0.0.1:${MIXED_PORT}"
     local no_proxy_addr="localhost,127.0.0.1,::1"
 
     export http_proxy=$http_proxy_addr
-    export https_proxy=$http_proxy
-    export HTTP_PROXY=$http_proxy
-    export HTTPS_PROXY=$http_proxy
+    export https_proxy=$http_proxy_addr
+    export HTTP_PROXY=$http_proxy_addr
+    export HTTPS_PROXY=$http_proxy_addr
 
     export all_proxy=$socks_proxy_addr
-    export ALL_PROXY=$all_proxy
+    export ALL_PROXY=$socks_proxy_addr
 
     export no_proxy=$no_proxy_addr
-    export NO_PROXY=$no_proxy
+    export NO_PROXY=$no_proxy_addr
+}
 
-    # Ensure mixin config directory exists and update using user permissions
-    mkdir -p "$(dirname "$MIHOMO_CONFIG_MIXIN")"
-    "$BIN_YQ" -i '.system-proxy.enable = true' "$MIHOMO_CONFIG_MIXIN" 2>/dev/null || {
-        _failcat "无法更新系统代理配置"
+_set_system_proxy() {
+    [ -f "$MIHOMO_CONFIG_RUNTIME" ] || {
+        _failcat "运行时配置文件不存在: $MIHOMO_CONFIG_RUNTIME"
         return 1
     }
+
+    local auth system_proxy_status
+    system_proxy_status=$(
+        "$BIN_YQ" '.system-proxy.enable // true' "$MIHOMO_CONFIG_MIXIN" 2>/dev/null
+    ) || {
+        _failcat "无法读取系统代理偏好"
+        return 1
+    }
+    if [ "$system_proxy_status" != true ]; then
+        _unset_system_proxy
+        return 0
+    fi
+
+    auth=$("$BIN_YQ" '.authentication[0] // ""' "$MIHOMO_CONFIG_RUNTIME" 2>/dev/null) || {
+        _failcat "无法读取代理认证配置"
+        return 1
+    }
+    [ -n "$auth" ] && auth=$auth@
+    _apply_system_proxy_environment "$auth"
 }
 
 _unset_system_proxy() {
@@ -43,65 +54,281 @@ _unset_system_proxy() {
     unset ALL_PROXY
     unset no_proxy
     unset NO_PROXY
+}
 
-    # Ensure mixin config exists and update using user permissions
-    mkdir -p "$(dirname "$MIHOMO_CONFIG_MIXIN")"
-    "$BIN_YQ" -i '.system-proxy.enable = false' "$MIHOMO_CONFIG_MIXIN" 2>/dev/null || {
-        _failcat "无法更新系统代理配置"
+_proxy_preference_before_commit() {
+    :
+}
+
+_managed_file_supported() {
+    [ ! -L "$1" ] && { [ ! -e "$1" ] || [ -f "$1" ]; }
+}
+
+_config_atomic_copy() {
+    local source=$1 destination=$2 destination_dir temporary
+    destination_dir=$(dirname "$destination") || return 1
+    mkdir -p "$destination_dir" || return 1
+    temporary=$(mktemp "${destination_dir}/.mihomo-config.XXXXXX") || return 1
+    if cp "$source" "$temporary" && chmod 0600 "$temporary" &&
+        mv -f "$temporary" "$destination"; then
+        return 0
+    fi
+    rm -f "$temporary"
+    return 1
+}
+
+_config_atomic_write() {
+    local destination=$1 value=$2 destination_dir temporary
+    destination_dir=$(dirname "$destination") || return 1
+    mkdir -p "$destination_dir" || return 1
+    temporary=$(mktemp "${destination_dir}/.mihomo-config.XXXXXX") || return 1
+    if printf '%s\n' "$value" > "$temporary" && chmod 0600 "$temporary" &&
+        mv -f "$temporary" "$destination"; then
+        return 0
+    fi
+    rm -f "$temporary"
+    return 1
+}
+
+_config_snapshot() {
+    local file_path=$1 snapshot_dir=$2 name=$3
+    _managed_file_supported "$file_path" || return 1
+    if [ -f "$file_path" ]; then
+        cp -p "$file_path" "$snapshot_dir/${name}.previous" || return 1
+        chmod 0600 "$snapshot_dir/${name}.previous" || return 1
+        printf '%s\n' present > "$snapshot_dir/${name}.state"
+    else
+        printf '%s\n' absent > "$snapshot_dir/${name}.state"
+    fi
+    chmod 0600 "$snapshot_dir/${name}.state"
+}
+
+_config_snapshot_present() {
+    [ "$(cat "$1/$2.state" 2>/dev/null)" = present ]
+}
+
+_lifecycle_before_object_publish() {
+    :
+}
+
+_lifecycle_after_object_publish() {
+    :
+}
+
+_lifecycle_before_object_restore() {
+    :
+}
+
+_config_publish() {
+    local name=$1 source=$2 destination=$3
+    _lifecycle_before_object_publish "$name" "$destination" || return 1
+    _config_atomic_copy "$source" "$destination" || return 1
+    _lifecycle_after_object_publish "$name" "$destination"
+}
+
+_config_restore() {
+    local file_path=$1 snapshot_dir=$2 name=$3 state
+    _lifecycle_before_object_restore "$name" "$file_path" || return 1
+    state=$(cat "$snapshot_dir/${name}.state" 2>/dev/null) || return 1
+    case "$state" in
+    present) _config_atomic_copy "$snapshot_dir/${name}.previous" "$file_path" ;;
+    absent) rm -f -- "$file_path" ;;
+    *) return 1 ;;
+    esac
+}
+
+_config_path_matches_snapshot() {
+    local file_path=$1 snapshot=$2 had_path=$3
+    if [ "$had_path" = true ]; then
+        _managed_file_supported "$file_path" && [ -f "$file_path" ] &&
+            cmp -s "$file_path" "$snapshot"
+    else
+        [ ! -e "$file_path" ] && [ ! -L "$file_path" ]
+    fi
+}
+
+_persist_system_proxy_preference() (
+    local enabled=$1 config_dir tmpdir candidate snapshot had_mixin=false status=0
+    _managed_file_supported "$MIHOMO_CONFIG_MIXIN" || return 1
+    config_dir=$(dirname "$MIHOMO_CONFIG_MIXIN") || return 1
+    mkdir -p "$config_dir" || return 1
+    tmpdir=$(mktemp -d "${config_dir}/.proxy-preference.XXXXXX") || return 1
+    chmod 0700 "$tmpdir" || {
+        rm -rf "$tmpdir"
+        return 1
+    }
+    candidate="$tmpdir/candidate"
+    snapshot="$tmpdir/snapshot"
+    trap 'status=$?; trap - EXIT HUP INT TERM; rm -rf "$tmpdir"; exit "$status"' EXIT HUP INT TERM
+
+    if [ -f "$MIHOMO_CONFIG_MIXIN" ]; then
+        cp -p "$MIHOMO_CONFIG_MIXIN" "$snapshot" || return 1
+        cp -p "$snapshot" "$candidate" || return 1
+        had_mixin=true
+    else
+        printf '{}\n' > "$candidate" || return 1
+    fi
+    case "$enabled" in
+    true) "$BIN_YQ" -i '.system-proxy.enable = true' "$candidate" 2>/dev/null || return 1 ;;
+    false) "$BIN_YQ" -i '.system-proxy.enable = false' "$candidate" 2>/dev/null || return 1 ;;
+    *) return 1 ;;
+    esac
+
+    _proxy_preference_before_commit "$MIHOMO_CONFIG_MIXIN" || return 1
+    _config_path_matches_snapshot "$MIHOMO_CONFIG_MIXIN" "$snapshot" "$had_mixin" || {
+        _failcat 'Mixin 在代理设置期间已被其他命令修改，本次操作已取消' || true
+        return 1
+    }
+    _config_atomic_copy "$candidate" "$MIHOMO_CONFIG_MIXIN" || return 1
+    trap - EXIT HUP INT TERM
+    rm -rf "$tmpdir"
+)
+
+function clashon() {
+    _mihomo_run_locked _clashon_locked "$@"
+}
+
+_build_runtime_candidate() {
+    local raw_config=$1 candidate=$2 show_ports=${3:-false}
+    local mixin_config=${4:-$MIHOMO_CONFIG_MIXIN}
+    local port_preference_mode=${5:-}
+    local port_preference_value=${6:-}
+    "$BIN_YQ" eval-all '. as $item ireduce ({}; . *+ $item) | (.. | select(tag == "!!seq")) |= unique' \
+        "$mixin_config" "$raw_config" "$mixin_config" > "$candidate" || {
+        _failcat '合并配置失败'
+        return 1
+    }
+    _resolve_port_conflicts "$candidate" "$show_ports" \
+        "$port_preference_mode" "$port_preference_value" || return 1
+    _valid_config "$candidate" || {
+        _failcat '验证失败：请检查 Mixin 配置'
+        return 1
     }
 }
 
-function clashon() {
-    # Ensure config directory exists
-    mkdir -p "$(dirname "$MIHOMO_CONFIG_RUNTIME")"
-    
-    # Merge configuration using user permissions
-    "$BIN_YQ" eval-all '. as $item ireduce ({}; . *+ $item) | (.. | select(tag == "!!seq")) |= unique' \
-        "$MIHOMO_CONFIG_MIXIN" "$MIHOMO_CONFIG_RAW" "$MIHOMO_CONFIG_MIXIN" > "$MIHOMO_CONFIG_RUNTIME"
-    
-    # 检查端口冲突并显示分配结果
-    _resolve_port_conflicts "$MIHOMO_CONFIG_RUNTIME" true
-    
-    # Start mihomo process
-    if start_mihomo; then
-        # Wait for mihomo to fully start
-        sleep 2
-        
-        # 验证实际端口并设置端口变量
-        _verify_actual_ports
-        
-        # 保存端口状态并设置系统代理
-        _save_port_state "$MIXED_PORT" "$UI_PORT" "$DNS_PORT"
-        _set_system_proxy
-        _okcat '已开启代理环境'
-    else
-        _failcat '代理启动失败'
-        return 1
+_activate_published_runtime_unlocked() {
+    _start_mihomo_unlocked || return 1
+    sleep 2
+    _verify_actual_ports || return 1
+    _save_port_state "$MIXED_PORT" "$UI_PORT" "$DNS_PORT" || return 1
+    _set_system_proxy || return 1
+}
+
+_refresh_runtime_environment_unlocked() {
+    if is_mihomo_running &&
+        command -v _get_proxy_port >/dev/null 2>&1 &&
+        command -v _get_ui_port >/dev/null 2>&1 &&
+        command -v _get_dns_port >/dev/null 2>&1; then
+        _get_proxy_port
+        _get_ui_port
+        _get_dns_port
+        # The transaction already persisted the proxy setting. This second
+        # call makes its exported variables visible in the interactive shell.
+        _set_system_proxy >/dev/null 2>&1 || true
     fi
+}
+
+_clashon_locked() {
+    local transaction_status=0
+    _clashon_unlocked "$@" || transaction_status=$?
+    [ "$transaction_status" -eq 0 ] || return "$transaction_status"
+    _refresh_runtime_environment_unlocked
+    _okcat '已开启代理环境'
+}
+
+_runtime_rebuild_and_start_unlocked() (
+    local show_ports=$1 tmpdir candidate was_running=false
+    local transaction_started=false transaction_committed=false service_transitioned=false
+
+    _runtime_transaction_cleanup() {
+        local transaction_status=$?
+        trap '' HUP INT TERM
+        trap - EXIT
+        if [ "$transaction_committed" != true ] && [ "$transaction_started" = true ]; then
+            if [ "$service_transitioned" = true ] && is_mihomo_running; then
+                _stop_mihomo_unlocked >/dev/null 2>&1 || true
+            fi
+            _config_restore "$MIHOMO_CONFIG_RUNTIME" "$tmpdir" runtime >/dev/null 2>&1 || true
+            if [ "$service_transitioned" = true ]; then
+                if [ "$was_running" = true ]; then
+                    _activate_published_runtime_unlocked >/dev/null 2>&1 || true
+                else
+                    _unset_system_proxy >/dev/null 2>&1 || true
+                fi
+            fi
+        fi
+        rm -rf "$tmpdir" 2>/dev/null || true
+        exit "$transaction_status"
+    }
+
+    _managed_file_supported "$MIHOMO_CONFIG_RAW" && [ -f "$MIHOMO_CONFIG_RAW" ] || return 1
+    _managed_file_supported "$MIHOMO_CONFIG_MIXIN" && [ -f "$MIHOMO_CONFIG_MIXIN" ] || return 1
+    _managed_file_supported "$MIHOMO_CONFIG_RUNTIME" || return 1
+    mkdir -p "${MIHOMO_BASE_DIR}/tmp" || return 1
+    tmpdir=$(mktemp -d "${MIHOMO_BASE_DIR}/tmp/runtime-change.XXXXXX") || return 1
+    chmod 0700 "$tmpdir" || {
+        rm -rf "$tmpdir"
+        return 1
+    }
+    candidate="$tmpdir/runtime.candidate"
+    _config_snapshot "$MIHOMO_CONFIG_RUNTIME" "$tmpdir" runtime || {
+        rm -rf "$tmpdir"
+        return 1
+    }
+    _build_runtime_candidate "$MIHOMO_CONFIG_RAW" "$candidate" "$show_ports" || {
+        rm -rf "$tmpdir"
+        return 1
+    }
+    chmod 0600 "$candidate" || {
+        rm -rf "$tmpdir"
+        return 1
+    }
+    is_mihomo_running && was_running=true
+
+    trap '_runtime_transaction_cleanup' EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    transaction_started=true
+    if [ "$was_running" = true ]; then
+        service_transitioned=true
+        _stop_mihomo_unlocked || return 1
+    fi
+    _config_publish runtime "$candidate" "$MIHOMO_CONFIG_RUNTIME" || return 1
+    service_transitioned=true
+    _activate_published_runtime_unlocked || return 1
+
+    transaction_committed=true
+    trap - EXIT HUP INT TERM
+    rm -rf "$tmpdir"
+)
+
+_clashon_unlocked() {
+    _runtime_rebuild_and_start_unlocked true
 }
 
 # 验证实际监听端口与配置是否一致
 _verify_actual_ports() {
     local log_file="$MIHOMO_BASE_DIR/logs/mihomo.log"
     [ ! -f "$log_file" ] && return 0
-    
+
     # Extract actual listening ports from log
     # Try both old format (Mixed) and new format (HTTP proxy)
     local actual_proxy_port=$(grep "Mixed(http+socks) proxy listening at:" "$log_file" | tail -1 | sed -n 's/.*127\.0\.0\.1:\([0-9]*\).*/\1/p')
     [ -z "$actual_proxy_port" ] && actual_proxy_port=$(grep "HTTP proxy listening at:" "$log_file" | tail -1 | sed -n 's/.*127\.0\.0\.1:\([0-9]*\).*/\1/p')
-    
+
     local actual_ui_port=$(grep "RESTful API listening at:" "$log_file" | tail -1 | sed -n 's/.*:\([0-9]\+\)[^0-9]*$/\1/p')
     local actual_dns_port=$(grep "DNS server(UDP) listening at:" "$log_file" | tail -1 | sed -n 's/.*\[::\]:\([0-9]*\).*/\1/p')
-    
+
     # 从配置文件获取期望端口进行比较
     local config_proxy_port=$("$BIN_YQ" '.mixed-port // 7890' "$MIHOMO_CONFIG_RUNTIME" 2>/dev/null)
     local config_ui_addr=$("$BIN_YQ" '.external-controller // "127.0.0.1:9090"' "$MIHOMO_CONFIG_RUNTIME" 2>/dev/null)
     local config_ui_port=${config_ui_addr##*:}
-    local config_dns_addr=$("$BIN_YQ" '.dns.listen // "0.0.0.0:15353"' "$MIHOMO_CONFIG_RUNTIME" 2>/dev/null)
+    local config_dns_addr=$("$BIN_YQ" '.dns.listen // "127.0.0.1:15353"' "$MIHOMO_CONFIG_RUNTIME" 2>/dev/null)
     local config_dns_port=${config_dns_addr##*:}
-    
+
     local port_changed=false
-    
+
     # 设置实际监听端口到变量
     if [ -n "$actual_proxy_port" ]; then
         MIXED_PORT=$actual_proxy_port
@@ -112,7 +339,7 @@ _verify_actual_ports() {
     else
         MIXED_PORT=$config_proxy_port
     fi
-    
+
     if [ -n "$actual_ui_port" ]; then
         UI_PORT=$actual_ui_port
         [ "$actual_ui_port" != "$config_ui_port" ] && {
@@ -122,7 +349,7 @@ _verify_actual_ports() {
     else
         UI_PORT=$config_ui_port
     fi
-    
+
     if [ -n "$actual_dns_port" ]; then
         DNS_PORT=$actual_dns_port
         [ "$actual_dns_port" != "$config_dns_port" ] && {
@@ -132,14 +359,14 @@ _verify_actual_ports() {
     else
         DNS_PORT=$config_dns_port
     fi
-    
+
     # 只有当端口有变化时才显示最终端口分配并重新设置系统代理
     if [ "$port_changed" = true ]; then
         _okcat "最终端口分配 - 代理:$MIXED_PORT UI:$UI_PORT DNS:$DNS_PORT"
         # 保存实际监听端口到状态文件
-        _save_port_state "$MIXED_PORT" "$UI_PORT" "$DNS_PORT"
+        _save_port_state "$MIXED_PORT" "$UI_PORT" "$DNS_PORT" || return 1
         # 端口变化时重新设置系统代理环境变量
-        _set_system_proxy
+        _set_system_proxy || return 1
     fi
 }
 
@@ -160,34 +387,39 @@ watch_proxy() {
 }
 
 function clashoff() {
+    _mihomo_run_locked _clashoff_unlocked "$@"
+}
+
+_clashoff_unlocked() {
     # Stop mihomo process
-    stop_mihomo
-    _unset_system_proxy
+    stop_mihomo || return 1
+    _unset_system_proxy || return 1
     _okcat '已关闭代理环境'
 }
 
 function clashrestart() {
+    _mihomo_run_locked _clashrestart_unlocked "$@"
+}
+
+_clashrestart_unlocked() {
+    local restart_status=0
     _okcat "正在重启代理服务..."
-    { clashoff && clashon; } >&/dev/null && _okcat "代理服务重启成功"
+    _merge_config_restart_unlocked || restart_status=$?
+    if [ "$restart_status" -ne 0 ]; then
+        _failcat "代理服务重启失败，已保留原配置和运行状态" || true
+        return "$restart_status"
+    fi
+    _refresh_runtime_environment_unlocked
+    _okcat "代理服务重启成功"
 }
 
 function clashproxy() {
-    case "$1" in
+    case "${1:-}" in
     on)
-        if is_mihomo_running; then
-            _get_proxy_port
-            _get_ui_port
-            _get_dns_port
-            _set_system_proxy
-            _okcat '已开启系统代理'
-        else
-            _failcat '无法开启系统代理：mihomo 进程未运行'
-            return 1
-        fi
+        _mihomo_run_locked _clashproxy_on_locked
         ;;
     off)
-        _unset_system_proxy
-        _okcat '已关闭系统代理'
+        _mihomo_run_locked _clashproxy_off_locked
         ;;
     status)
         local system_proxy_status=$("$BIN_YQ" '.system-proxy.enable' "$MIHOMO_CONFIG_MIXIN" 2>/dev/null)
@@ -195,7 +427,7 @@ function clashproxy() {
             _failcat "系统代理：关闭"
             return 1
         fi
-        
+
         if is_mihomo_running; then
             _okcat "系统代理：开启
 http_proxy： $http_proxy
@@ -216,8 +448,141 @@ EOF
     esac
 }
 
+_clashproxy_on_locked() {
+    local auth
+
+    is_mihomo_running || {
+        _failcat '无法开启系统代理：mihomo 进程未运行'
+        return 1
+    }
+    _get_proxy_port || return 1
+    _get_ui_port || return 1
+    _get_dns_port || return 1
+    [ -f "$MIHOMO_CONFIG_RUNTIME" ] || {
+        _failcat "运行时配置文件不存在: $MIHOMO_CONFIG_RUNTIME"
+        return 1
+    }
+    auth=$("$BIN_YQ" '.authentication[0] // ""' "$MIHOMO_CONFIG_RUNTIME" 2>/dev/null) || {
+        _failcat "无法读取代理认证配置"
+        return 1
+    }
+    [ -n "$auth" ] && auth=$auth@
+
+    _persist_system_proxy_preference true || {
+        _failcat "无法更新系统代理配置"
+        return 1
+    }
+    _apply_system_proxy_environment "$auth"
+    _okcat '已开启系统代理'
+}
+
+_clashproxy_off_locked() {
+    _persist_system_proxy_preference false || {
+        _failcat "无法更新系统代理配置"
+        return 1
+    }
+    _unset_system_proxy
+    _okcat '已关闭系统代理'
+}
+
+_clashport_apply_unlocked() (
+    local mode=$1 value=${2:-}
+    local tmpdir preference_candidate runtime_candidate was_running=false
+    local service_transitioned=false transaction_started=false transaction_committed=false
+
+    _port_transaction_cleanup() {
+        local transaction_status=$?
+        trap '' HUP INT TERM
+        trap - EXIT
+        if [ "$transaction_committed" != true ] && [ "$transaction_started" = true ]; then
+            if [ "$service_transitioned" = true ] && is_mihomo_running; then
+                _stop_mihomo_unlocked >/dev/null 2>&1 || true
+            fi
+            _config_restore "$MIHOMO_PORT_PREF" "$tmpdir" preference >/dev/null 2>&1 || true
+            _config_restore "$MIHOMO_CONFIG_RUNTIME" "$tmpdir" runtime >/dev/null 2>&1 || true
+            if [ "$service_transitioned" = true ]; then
+                if [ "$was_running" = true ]; then
+                    _activate_published_runtime_unlocked >/dev/null 2>&1 || true
+                else
+                    _unset_system_proxy >/dev/null 2>&1 || true
+                fi
+            fi
+        fi
+        rm -rf "$tmpdir" 2>/dev/null || true
+        exit "$transaction_status"
+    }
+
+    [ -d "$MIHOMO_BASE_DIR" ] || {
+        _failcat "安装目录不存在：$MIHOMO_BASE_DIR" || true
+        return 1
+    }
+    _managed_file_supported "$MIHOMO_PORT_PREF" || return 1
+    _managed_file_supported "$MIHOMO_CONFIG_RUNTIME" || return 1
+    mkdir -p "${MIHOMO_BASE_DIR}/tmp" "$(dirname "$MIHOMO_PORT_PREF")" || return 1
+    tmpdir=$(mktemp -d "${MIHOMO_BASE_DIR}/tmp/port-change.XXXXXX") || return 1
+    chmod 0700 "$tmpdir" || {
+        rm -rf "$tmpdir"
+        return 1
+    }
+    preference_candidate="$tmpdir/port.candidate"
+    runtime_candidate="$tmpdir/runtime.candidate.yaml"
+    _config_snapshot "$MIHOMO_PORT_PREF" "$tmpdir" preference || {
+        rm -rf "$tmpdir"
+        return 1
+    }
+    _config_snapshot "$MIHOMO_CONFIG_RUNTIME" "$tmpdir" runtime || {
+        rm -rf "$tmpdir"
+        return 1
+    }
+    _write_port_preferences_file "$preference_candidate" "$mode" "$value" || {
+        rm -rf "$tmpdir"
+        return 1
+    }
+    chmod 0600 "$preference_candidate" || return 1
+    is_mihomo_running && was_running=true
+
+    if [ "$was_running" = true ]; then
+        _build_runtime_candidate "$MIHOMO_CONFIG_RAW" "$runtime_candidate" false \
+            "$MIHOMO_CONFIG_MIXIN" "$mode" "$value" || {
+            rm -rf "$tmpdir"
+            return 1
+        }
+        chmod 0600 "$runtime_candidate" || return 1
+    fi
+
+    trap '_port_transaction_cleanup' EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    transaction_started=true
+    if [ "$was_running" = true ]; then
+        service_transitioned=true
+        _stop_mihomo_unlocked || return 1
+    fi
+    _config_publish preference "$preference_candidate" "$MIHOMO_PORT_PREF" || return 1
+    if [ "$was_running" = true ]; then
+        _config_publish runtime "$runtime_candidate" "$MIHOMO_CONFIG_RUNTIME" || return 1
+        _activate_published_runtime_unlocked || return 1
+    fi
+
+    transaction_committed=true
+    trap - EXIT HUP INT TERM
+    rm -rf "$tmpdir" 2>/dev/null || true
+)
+
+_clashport_apply_locked() {
+    local mode=$1 value=${2:-}
+    _clashport_apply_unlocked "$mode" "$value" || return 1
+    _refresh_runtime_environment_unlocked
+    if [ "$mode" = manual ]; then
+        _okcat "已固定代理端口：$value"
+    else
+        _okcat "已切换为自动分配代理端口"
+    fi
+}
+
 function clashport() {
-    local action=$1
+    local action=${1:-}
     shift || true
 
     case "$action" in
@@ -234,38 +599,45 @@ function clashport() {
         _okcat "当前代理端口：$MIXED_PORT"
         ;;
     auto)
-        _save_port_preferences auto ""
-        _okcat "已切换为自动分配代理端口"
-        if is_mihomo_running; then
-            _okcat "正在重新应用配置..."
-            clashrestart
-        fi
+        _mihomo_run_locked _clashport_apply_locked auto ""
         ;;
     set|manual)
-        local manual_port=$1
+        local manual_port=${1:-}
         local prefer_auto=false
 
         while true; do
             if [ -z "$manual_port" ]; then
                 printf "请输入想要固定的代理端口 [1024-65535]: "
-                read -r manual_port
+                if ! read -r manual_port; then
+                    _failcat "未读取到端口，已取消设置" || true
+                    return 1
+                fi
             fi
 
             if [ -z "$manual_port" ]; then
                 _failcat "未输入端口"
+                _has_tty || return 1
                 continue
             fi
 
             if ! [[ $manual_port =~ ^[0-9]+$ ]] || [ "$manual_port" -lt 1024 ] || [ "$manual_port" -gt 65535 ]; then
                 _failcat "端口号无效，请输入 1024-65535 之间的数字"
                 manual_port=""
+                _has_tty || return 1
                 continue
             fi
 
             if _is_already_in_use "$manual_port" "$BIN_KERNEL_NAME"; then
                 _failcat '🎯' "端口 $manual_port 已被占用"
+                _has_tty || {
+                    _failcat "非交互环境无法选择新端口；请改用 clash port auto 或指定其他端口" || true
+                    return 1
+                }
                 printf "选择操作 [r]重新输入/[a]自动分配: "
-                read -r choice
+                if ! read -r choice; then
+                    _failcat "未读取到选择，已取消设置" || true
+                    return 1
+                fi
                 case "$choice" in
                 [aA])
                     prefer_auto=true
@@ -286,16 +658,9 @@ function clashport() {
         done
 
         if [ "$prefer_auto" = true ]; then
-            _save_port_preferences auto ""
-            _okcat "已切换为自动分配代理端口"
+            _mihomo_run_locked _clashport_apply_locked auto ""
         else
-            _save_port_preferences manual "$manual_port"
-            _okcat "已固定代理端口：$manual_port"
-        fi
-
-        if is_mihomo_running; then
-            _okcat "正在重新应用配置..."
-            clashrestart
+            _mihomo_run_locked _clashport_apply_locked manual "$manual_port"
         fi
         ;;
     *)
@@ -312,7 +677,8 @@ EOF
 function clashstatus() {
     local pid_file="$MIHOMO_BASE_DIR/config/mihomo.pid"
     local log_file="$MIHOMO_BASE_DIR/logs/mihomo.log"
-    
+    local pid='' managed_pids='' uptime=''
+
     # Show subscription URL
     local subscription_url=$(cat "$MIHOMO_CONFIG_URL" 2>/dev/null)
     if [ -n "$subscription_url" ]; then
@@ -320,16 +686,27 @@ function clashstatus() {
     else
         _failcat "订阅地址: 未设置"
     fi
-    
+
     if is_mihomo_running; then
-        local pid=$(cat "$pid_file" 2>/dev/null)
-        local uptime=$(ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ')
+        pid=$(cat "$pid_file" 2>/dev/null || true)
+        if ! _is_mihomo_pid "$pid"; then
+            managed_pids=$(_find_managed_mihomo_pids) || {
+                _failcat "mihomo 进程状态: 无法安全确认"
+                return 1
+            }
+            pid=$(printf '%s\n' "$managed_pids" | sed -n '1p')
+        fi
+        if [ -z "$pid" ]; then
+            _failcat "mihomo 进程状态: 查询期间已停止"
+            return 1
+        fi
+        uptime=$(ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ')
         _okcat "mihomo 进程状态: 运行中"
         _okcat "进程 PID: $pid"
         _okcat "运行时间: ${uptime:-未知}"
         _okcat "配置文件: $MIHOMO_CONFIG_RUNTIME"
         _okcat "日志文件: $log_file"
-        
+
         # Show proxy port status
         if [ -f "$MIHOMO_CONFIG_RUNTIME" ]; then
             _get_proxy_port
@@ -341,42 +718,23 @@ function clashstatus() {
         else
             _failcat "配置文件不存在，无法获取端口信息"
         fi
-        
+
         # Show system proxy status
         clashproxy status
     else
         _failcat "mihomo 进程状态: 未运行"
-        [ -f "$pid_file" ] && {
-            _failcat "发现残留 PID 文件，已清理"
-            rm -f "$pid_file"
-        }
+        [ ! -f "$pid_file" ] || _failcat "检测到 PID 文件；状态查询不会自动清理" || true
         return 1
     fi
 }
 
 function clashui() {
-    _get_ui_port
-    # 公网ip
-    # ifconfig.me
-    local query_url='api64.ipify.org'
-    local public_ip=$(curl -s --noproxy "*" --connect-timeout 2 $query_url)
-    local public_address="http://${public_ip:-公网}:${UI_PORT}/ui"
-    # 内网ip
-    # ip route get 1.1.1.1 | grep -oP 'src \K\S+'
-    local local_ip=$(hostname -I | awk '{print $1}')
-    local local_address="http://${local_ip}:${UI_PORT}/ui"
-    printf "\n"
-    printf "╔═══════════════════════════════════════════════╗\n"
-    printf "║                %s                  ║\n" "$(_okcat 'Web 控制台')"
-    printf "║═══════════════════════════════════════════════║\n"
-    printf "║                                               ║\n"
-    printf "║     🔓 注意放行端口：%-5s                    ║\n" "$UI_PORT"
-    printf "║     🏠 内网：%-31s  ║\n" "$local_address"
-    printf "║     🌏 公网：%-31s  ║\n" "$public_address"
-    printf "║     ☁️  公共：%-31s  ║\n" "$URL_CLASH_UI"
-    printf "║                                               ║\n"
-    printf "╚═══════════════════════════════════════════════╝\n"
-    printf "\n"
+    _get_ui_port || return 1
+    _okcat "本机 Web 控制台：http://127.0.0.1:${UI_PORT}/ui"
+    _okcat "远程访问请在自己的电脑建立 SSH 隧道："
+    printf 'ssh -L %s:127.0.0.1:%s user@server\n' "$UI_PORT" "$UI_PORT"
+    _okcat "隧道建立后打开：http://127.0.0.1:${UI_PORT}/ui"
+    _okcat "管理 API 默认仅监听本机，无需在防火墙中放行该端口。"
 }
 
 function clashtui() {
@@ -405,44 +763,174 @@ function clashtui() {
 
     # 生成配置并启动 TUI
     local endpoint="http://127.0.0.1:${UI_PORT}"
-    local api_secret=$("$BIN_YQ" '.secret // ""' "$MIHOMO_CONFIG_RUNTIME" 2>/dev/null)
+    local api_secret
     local config_file="${MIHOMO_BASE_DIR}/config/clashctl.ron"
+    local config_tmp=''
 
-    _generate_clashctl_config "mihomo-local" "$endpoint" "$api_secret" > "$config_file" || {
-        _failcat "生成配置失败"
+    api_secret=$("$BIN_YQ" '.secret // ""' "$MIHOMO_CONFIG_RUNTIME" 2>/dev/null) || {
+        _failcat "无法读取 Web 控制台密钥"
         return 1
     }
+
+    mkdir -p "$(dirname "$config_file")" || return 1
+    config_tmp=$(mktemp "${config_file}.tmp.XXXXXX") || {
+        _failcat "无法安全暂存 TUI 配置"
+        return 1
+    }
+    if ! _generate_clashctl_config "mihomo-local" "$endpoint" "$api_secret" > "$config_tmp" ||
+        ! chmod 0600 "$config_tmp" ||
+        ! mv -f "$config_tmp" "$config_file"; then
+        rm -f "$config_tmp"
+        _failcat "生成配置失败"
+        return 1
+    fi
+    config_tmp=''
 
     _okcat "正在连接 $endpoint ..."
     "$clashctl_bin" --config-path "$config_file" tui
 }
 
 _merge_config_restart() {
-    # Use user-accessible temp directory instead of /tmp
-    local backup="${MIHOMO_BASE_DIR}/config/runtime.backup"
-    
-    # Ensure config directory exists
-    mkdir -p "$(dirname "$backup")"
-    
-    # Backup current runtime config
-    cat "$MIHOMO_CONFIG_RUNTIME" 2>/dev/null > "$backup"
-    
-    # Merge configurations using user permissions
-    "$BIN_YQ" eval-all '. as $item ireduce ({}; . *+ $item) | (.. | select(tag == "!!seq")) |= unique' \
-        "$MIHOMO_CONFIG_MIXIN" "$MIHOMO_CONFIG_RAW" "$MIHOMO_CONFIG_MIXIN" > "$MIHOMO_CONFIG_RUNTIME"
-    
-    # Validate merged configuration
-    _valid_config "$MIHOMO_CONFIG_RUNTIME" || {
-        # Restore backup on validation failure
-        cat "$backup" > "$MIHOMO_CONFIG_RUNTIME" 2>/dev/null
-        _error_quit "验证失败：请检查 Mixin 配置"
-    }
-    
-    # Clean up backup file
-    rm -f "$backup"
-    
-    clashrestart
+    _mihomo_run_locked _merge_config_restart_locked "$@"
 }
+
+_merge_config_restart_locked() {
+    local transaction_status=0
+    _merge_config_restart_unlocked "$@" || transaction_status=$?
+    [ "$transaction_status" -eq 0 ] || return "$transaction_status"
+    _refresh_runtime_environment_unlocked
+}
+
+_merge_config_restart_unlocked() {
+    _runtime_rebuild_and_start_unlocked false
+}
+
+_write_mixin_candidate() {
+    local field=$1 value=$2 candidate=$3
+
+    case "$field" in
+    secret)
+        CLASH_FOR_LAB_MIXIN_VALUE=$value \
+            "$BIN_YQ" -i '.secret = strenv(CLASH_FOR_LAB_MIXIN_VALUE)' "$candidate"
+        ;;
+    tun)
+        case "$value" in
+        true) "$BIN_YQ" -i '.tun.enable = true' "$candidate" ;;
+        false) "$BIN_YQ" -i '.tun.enable = false' "$candidate" ;;
+        *) return 1 ;;
+        esac
+        ;;
+    lan)
+        case "$value" in
+        true) "$BIN_YQ" -i '.allow-lan = true' "$candidate" ;;
+        false) "$BIN_YQ" -i '.allow-lan = false' "$candidate" ;;
+        *) return 1 ;;
+        esac
+        ;;
+    *)
+        return 1
+        ;;
+    esac
+}
+
+_apply_mixin_change() {
+    _mihomo_run_locked _apply_mixin_change_locked "$@"
+}
+
+_apply_mixin_change_locked() {
+    local transaction_status=0
+    _apply_mixin_change_unlocked "$@" || transaction_status=$?
+    [ "$transaction_status" -eq 0 ] || return "$transaction_status"
+    _refresh_runtime_environment_unlocked
+}
+
+_apply_mixin_change_unlocked() (
+    local field=$1 value=$2
+    local tmpdir mixin_candidate runtime_candidate was_running=false
+    local service_transitioned=false transaction_started=false transaction_committed=false
+
+    _mixin_transaction_cleanup() {
+        local transaction_status=$?
+        trap '' HUP INT TERM
+        trap - EXIT
+        if [ "$transaction_committed" != true ] && [ "$transaction_started" = true ]; then
+            if [ "$service_transitioned" = true ] && is_mihomo_running; then
+                _stop_mihomo_unlocked >/dev/null 2>&1 || true
+            fi
+            _config_restore "$MIHOMO_CONFIG_MIXIN" "$tmpdir" mixin >/dev/null 2>&1 || true
+            _config_restore "$MIHOMO_CONFIG_RUNTIME" "$tmpdir" runtime >/dev/null 2>&1 || true
+            if [ "$service_transitioned" = true ]; then
+                if [ "$was_running" = true ]; then
+                    _activate_published_runtime_unlocked >/dev/null 2>&1 || true
+                else
+                    _unset_system_proxy >/dev/null 2>&1 || true
+                fi
+            fi
+        fi
+        rm -rf "$tmpdir" 2>/dev/null || true
+        exit "$transaction_status"
+    }
+
+    _managed_file_supported "$MIHOMO_CONFIG_MIXIN" || return 1
+    _managed_file_supported "$MIHOMO_CONFIG_RUNTIME" || return 1
+    _managed_file_supported "$MIHOMO_CONFIG_RAW" && [ -f "$MIHOMO_CONFIG_RAW" ] || return 1
+    mkdir -p "${MIHOMO_BASE_DIR}/tmp" "$(dirname "$MIHOMO_CONFIG_MIXIN")" || return 1
+    tmpdir=$(mktemp -d "${MIHOMO_BASE_DIR}/tmp/mixin-change.XXXXXX") || return 1
+    chmod 0700 "$tmpdir" || {
+        rm -rf "$tmpdir"
+        return 1
+    }
+    mixin_candidate="$tmpdir/mixin.candidate.yaml"
+    runtime_candidate="$tmpdir/runtime.candidate.yaml"
+    _config_snapshot "$MIHOMO_CONFIG_MIXIN" "$tmpdir" mixin || {
+        rm -rf "$tmpdir"
+        return 1
+    }
+    _config_snapshot "$MIHOMO_CONFIG_RUNTIME" "$tmpdir" runtime || {
+        rm -rf "$tmpdir"
+        return 1
+    }
+    if _config_snapshot_present "$tmpdir" mixin; then
+        cp -p "$tmpdir/mixin.previous" "$mixin_candidate" || {
+            rm -rf "$tmpdir"
+            return 1
+        }
+    else
+        printf '{}\n' > "$mixin_candidate" || {
+            rm -rf "$tmpdir"
+            return 1
+        }
+    fi
+    _write_mixin_candidate "$field" "$value" "$mixin_candidate" || {
+        rm -rf "$tmpdir"
+        return 1
+    }
+    _build_runtime_candidate "$MIHOMO_CONFIG_RAW" "$runtime_candidate" false "$mixin_candidate" || {
+        rm -rf "$tmpdir"
+        return 1
+    }
+    chmod 0600 "$mixin_candidate" "$runtime_candidate" || return 1
+    is_mihomo_running && was_running=true
+
+    trap '_mixin_transaction_cleanup' EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    transaction_started=true
+    if [ "$was_running" = true ]; then
+        service_transitioned=true
+        _stop_mihomo_unlocked || return 1
+    fi
+    _config_publish mixin "$mixin_candidate" "$MIHOMO_CONFIG_MIXIN" || return 1
+    _config_publish runtime "$runtime_candidate" "$MIHOMO_CONFIG_RUNTIME" || return 1
+    if [ "$was_running" = true ]; then
+        _activate_published_runtime_unlocked || return 1
+    fi
+
+    transaction_committed=true
+    trap - EXIT HUP INT TERM
+    rm -rf "$tmpdir"
+)
 
 function clashsecret() {
     case "$#" in
@@ -454,13 +942,10 @@ function clashsecret() {
         fi
         ;;
     1)
-        # Ensure mixin config directory exists
-        mkdir -p "$(dirname "$MIHOMO_CONFIG_MIXIN")"
-        "$BIN_YQ" -i ".secret = \"$1\"" "$MIHOMO_CONFIG_MIXIN" 2>/dev/null || {
+        _apply_mixin_change secret "$1" || {
             _failcat "密钥更新失败，请重新输入"
             return 1
         }
-        _merge_config_restart
         _okcat "密钥更新成功，已重启生效"
         ;;
     *)
@@ -482,26 +967,21 @@ _tunstatus() {
 
 _tunoff() {
     _tunstatus >/dev/null || return 0
-    # Ensure mixin config directory exists
-    mkdir -p "$(dirname "$MIHOMO_CONFIG_MIXIN")"
-    "$BIN_YQ" -i '.tun.enable = false' "$MIHOMO_CONFIG_MIXIN" 2>/dev/null || {
+    _apply_mixin_change tun false || {
         _failcat "无法更新 Tun 配置"
         return 1
     }
-    _merge_config_restart && _okcat "Tun 模式已关闭"
+    _okcat "Tun 模式已关闭"
 }
 
 _tunon() {
     _tunstatus 2>/dev/null && return 0
-    # Ensure mixin config directory exists
-    mkdir -p "$(dirname "$MIHOMO_CONFIG_MIXIN")"
-    "$BIN_YQ" -i '.tun.enable = true' "$MIHOMO_CONFIG_MIXIN" 2>/dev/null || {
+    _apply_mixin_change tun true || {
         _failcat "无法更新 Tun 配置"
         return 1
     }
-    _merge_config_restart
     sleep 0.5s
-    
+
     # Check if mihomo is running and tun mode is working
     if is_mihomo_running; then
         local log_file="$MIHOMO_BASE_DIR/logs/mihomo.log"
@@ -555,24 +1035,22 @@ _lanoff() {
         [ "$current_status" = 'false' ] && return 0
     }
 
-    mkdir -p "$(dirname "$MIHOMO_CONFIG_MIXIN")"
-    "$BIN_YQ" -i '.allow-lan = false' "$MIHOMO_CONFIG_MIXIN" 2>/dev/null || {
+    _apply_mixin_change lan false || {
         _failcat "无法更新局域网访问配置"
         return 1
     }
-    _merge_config_restart && _okcat "局域网访问已关闭"
+    _okcat "局域网访问已关闭"
 }
 
 _lanon() {
     local current_status=$("$BIN_YQ" '.allow-lan // false' "${MIHOMO_CONFIG_RUNTIME}" 2>/dev/null)
     [ "$current_status" = 'true' ] && return 0
 
-    mkdir -p "$(dirname "$MIHOMO_CONFIG_MIXIN")"
-    "$BIN_YQ" -i '.allow-lan = true' "$MIHOMO_CONFIG_MIXIN" 2>/dev/null || {
+    _apply_mixin_change lan true || {
         _failcat "无法更新局域网访问配置"
         return 1
     }
-    _merge_config_restart && _okcat "局域网访问已开启"
+    _okcat "局域网访问已开启"
 }
 
 function clashlan() {
@@ -592,40 +1070,67 @@ function clashlan() {
     esac
 }
 
+_subscription_path_is_supported() {
+    _managed_file_supported "$1"
+}
+
+_subscription_update_paths_are_supported() {
+    local managed_path
+    for managed_path in \
+        "$MIHOMO_CONFIG_RAW" "$MIHOMO_CONFIG_RAW_BAK" \
+        "$MIHOMO_CONFIG_RUNTIME" "$MIHOMO_CONFIG_URL" \
+        "$MIHOMO_CONFIG_MIXIN" "$MIHOMO_PORT_PREF" \
+        "$MIHOMO_PORT_STATE" "$MIHOMO_UPDATE_LOG"; do
+        _subscription_path_is_supported "$managed_path" || return 1
+    done
+}
+
+_clashsubscribe_set_locked() {
+    local new_url=$1
+    _subscription_path_is_supported "$MIHOMO_CONFIG_URL" || {
+        _failcat '订阅地址文件是符号链接或特殊文件，已拒绝修改' || true
+        return 1
+    }
+    _config_atomic_write "$MIHOMO_CONFIG_URL" "$new_url"
+}
+
 function clashsubscribe() {
+    local new_url response url
     case "$#" in
     0)
-        # Show current subscription URL
-        local url=$(cat "$MIHOMO_CONFIG_URL" 2>/dev/null)
-        if [ -n "$url" ]; then
+        if _subscription_path_is_supported "$MIHOMO_CONFIG_URL" &&
+            url=$(_read_subscription_url_snapshot "$MIHOMO_CONFIG_URL"); then
             _okcat "当前订阅地址: $url"
         else
-            _failcat "未设置订阅地址"
+            _failcat "未设置有效的订阅地址"
             return 1
         fi
         ;;
     1)
-        # Set new subscription URL
-        local new_url="$1"
-        if [ "${new_url:0:4}" != "http" ]; then
-            _failcat "无效的订阅地址，必须以 http 或 https 开头"
+        new_url=$1
+        _is_valid_subscription_url "$new_url" || {
+            _failcat "无效的订阅地址，必须是完整的小写 http:// 或 https:// URL"
             return 1
-        fi
-        
-        # Save URL
-        mkdir -p "$(dirname "$MIHOMO_CONFIG_URL")"
-        echo "$new_url" > "$MIHOMO_CONFIG_URL"
-        _okcat "订阅地址已设置: $new_url"
-        
-        # Ask if user wants to update immediately
+        }
+        _subscription_path_is_supported "$MIHOMO_CONFIG_URL" || {
+            _failcat '订阅地址文件是符号链接或特殊文件，已拒绝修改'
+            return 1
+        }
+        _mihomo_run_locked _clashsubscribe_set_locked "$new_url" || return 1
+        _okcat "订阅地址已保存"
+
         printf "是否立即更新订阅配置? [y/N]: "
-        read -r response
+        if ! IFS= read -r response; then
+            response=
+        fi
         case "$response" in
         [yY]|[yY][eE][sS])
-            clashupdate "$new_url"
+            # Read the URL again under the update lock. If another clash command
+            # changed it while this prompt was open, the current value wins.
+            clashupdate
             ;;
         *)
-            _okcat "订阅地址已保存，使用 'clash update' 命令更新配置"
+            _okcat "使用 'clash update' 命令可随时更新配置"
             ;;
         esac
         ;;
@@ -635,76 +1140,282 @@ function clashsubscribe() {
     无参数      显示当前订阅地址
     URL         设置新的订阅地址
 EOF
+        return 1
         ;;
     esac
 }
 
-function clashupdate() {
-    local url=$(cat "$MIHOMO_CONFIG_URL" 2>/dev/null)
-    local is_auto
+_append_subscription_update_log() {
+    local log_dir
+    log_dir=$(dirname "$MIHOMO_UPDATE_LOG") || return 1
+    if [ -L "$MIHOMO_UPDATE_LOG" ] ||
+        { [ -e "$MIHOMO_UPDATE_LOG" ] && [ ! -f "$MIHOMO_UPDATE_LOG" ]; }; then
+        return 1
+    fi
+    mkdir -p "$log_dir" || return 1
+    if [ ! -e "$MIHOMO_UPDATE_LOG" ]; then
+        (umask 077 && : > "$MIHOMO_UPDATE_LOG") || return 1
+    fi
+    chmod 0600 "$MIHOMO_UPDATE_LOG" || return 1
+    printf '[%s] 订阅更新成功\n' "$(date '+%Y-%m-%d %H:%M:%S')" >> "$MIHOMO_UPDATE_LOG"
+}
 
-    case "$1" in
-    auto)
-        is_auto=true
-        [ -n "$2" ] && url=$2
-        ;;
-    log)
-        tail "${MIHOMO_UPDATE_LOG}" 2>/dev/null || _failcat "暂无更新日志"
-        return 0
-        ;;
-    *)
-        [ -n "$1" ] && url=$1
-        ;;
+_is_valid_subscription_url() {
+    local url=$1 remainder authority hostport host port
+
+    case "$url" in
+    http://*) remainder=${url#http://} ;;
+    https://*) remainder=${url#https://} ;;
+    *) return 1 ;;
+    esac
+    case "$url" in
+    *[[:space:]]*) return 1 ;;
     esac
 
-    # 如果没有提供有效的订阅链接（url为空或者不是http开头），则使用默认配置文件
-    [ "${url:0:4}" != "http" ] && {
-        _failcat "没有提供有效的订阅链接：使用 ${MIHOMO_CONFIG_RAW} 进行更新..."
-        url="file://$MIHOMO_CONFIG_RAW"
+    authority=${remainder%%[/?#]*}
+    [ -n "$authority" ] || return 1
+    hostport=${authority##*@}
+    [ -n "$hostport" ] || return 1
+
+    case "$hostport" in
+    \[*\]*)
+        host=${hostport#\[}
+        host=${host%%\]*}
+        [ -n "$host" ] || return 1
+        port=${hostport#*\]}
+        case "$port" in
+        '') ;;
+        :*)
+            port=${port#:}
+            [ -n "$port" ] || return 1
+            case "$port" in
+            *[!0-9]*) return 1 ;;
+            esac
+            [ "${#port}" -le 5 ] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || return 1
+            ;;
+        *) return 1 ;;
+        esac
+        ;;
+    *)
+        case "$hostport" in
+        *'['*|*']'*) return 1 ;;
+        esac
+        host=${hostport%%:*}
+        [ -n "$host" ] || return 1
+        if [ "$hostport" != "$host" ]; then
+            port=${hostport#*:}
+            [ -n "$port" ] || return 1
+            case "$port" in
+            *[!0-9]*) return 1 ;;
+            esac
+            [ "${#port}" -le 5 ] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || return 1
+        fi
+        ;;
+    esac
+}
+
+_read_subscription_url_snapshot() (
+    local snapshot=$1 url='' extra='' first_status=0 second_status=0
+    [ -f "$snapshot" ] && [ ! -L "$snapshot" ] || return 1
+    exec 3< "$snapshot" || return 1
+    IFS= read -r url <&3 || first_status=$?
+    IFS= read -r extra <&3 || second_status=$?
+    exec 3<&-
+    [ "$first_status" -eq 0 ] || [ -n "$url" ] || return 1
+    [ "$second_status" -ne 0 ] && [ -z "$extra" ] || return 1
+    _is_valid_subscription_url "$url" || return 1
+    printf '%s' "$url"
+)
+
+_clashupdate_apply_locked() (
+    local explicit_url=$1 url=${2:-}
+    local tmpdir snapshot_dir raw_candidate runtime_candidate url_candidate
+    local was_running=false service_transitioned=false
+    local transaction_started=false transaction_committed=false
+
+    _clashupdate_cleanup() {
+        local transaction_status=$? restore_failed=false
+        trap '' HUP INT TERM
+        trap - EXIT
+        if [ "$transaction_committed" != true ] && [ "$transaction_started" = true ]; then
+            if [ "$service_transitioned" = true ] && is_mihomo_running; then
+                _stop_mihomo_unlocked >/dev/null 2>&1 || true
+            fi
+            _config_restore "$MIHOMO_CONFIG_RAW" "$snapshot_dir" raw >/dev/null 2>&1 ||
+                restore_failed=true
+            _config_restore "$MIHOMO_CONFIG_RAW_BAK" "$snapshot_dir" raw-bak >/dev/null 2>&1 ||
+                restore_failed=true
+            _config_restore "$MIHOMO_CONFIG_RUNTIME" "$snapshot_dir" runtime >/dev/null 2>&1 ||
+                restore_failed=true
+            _config_restore "$MIHOMO_CONFIG_URL" "$snapshot_dir" url >/dev/null 2>&1 ||
+                restore_failed=true
+            if [ "$service_transitioned" = true ]; then
+                if [ "$was_running" = true ]; then
+                    _activate_published_runtime_unlocked >/dev/null 2>&1 ||
+                        restore_failed=true
+                else
+                    _unset_system_proxy >/dev/null 2>&1 || true
+                fi
+            fi
+            [ "$restore_failed" = false ] ||
+                _failcat '订阅更新失败，配置或服务状态未能完整恢复，请立即检查' || true
+        fi
+        rm -rf "$tmpdir" 2>/dev/null || true
+        exit "$transaction_status"
     }
 
-    # 如果是自动更新模式，则设置用户级定时任务
-    [ "$is_auto" = true ] && {
-        # Persist URL for cron runs (cron executes `mihomoctl update`, which reads MIHOMO_CONFIG_URL).
-        [ "${url:0:4}" = "http" ] && {
-            mkdir -p "$(dirname "$MIHOMO_CONFIG_URL")"
-            echo "$url" > "$MIHOMO_CONFIG_URL"
-        }
-
-        # Check if crontab entry already exists
-        crontab -l 2>/dev/null | grep -qs 'mihomoctl_auto_update' || {
-            # Add user-level crontab entry (every 2 days at midnight)
-            (crontab -l 2>/dev/null; echo "0 0 */2 * * $_SHELL -i -c 'mihomoctl update' # mihomoctl_auto_update") | crontab -
-        }
-        _okcat "已设置用户级定时更新订阅 (每2天执行一次)" && return 0
+    _subscription_update_paths_are_supported || {
+        _failcat '订阅受管配置包含符号链接或特殊文件，已拒绝更新且未改动任何配置' || true
+        return 1
     }
+    if [ "$explicit_url" != true ]; then
+        url=$(_read_subscription_url_snapshot "$MIHOMO_CONFIG_URL") || {
+            _failcat '已保存的订阅地址无效，请重新执行 clash subscribe URL' || true
+            return 1
+        }
+    fi
 
-    _okcat '👌' "正在下载：原配置已备份..."
-    
-    # Ensure directories exist and backup using user permissions
-    mkdir -p "$(dirname "$MIHOMO_CONFIG_RAW_BAK")" "$(dirname "$MIHOMO_UPDATE_LOG")"
-    cp "$MIHOMO_CONFIG_RAW" "$MIHOMO_CONFIG_RAW_BAK" 2>/dev/null
+    umask 077
+    mkdir -p "${MIHOMO_BASE_DIR}/tmp" || return 1
+    tmpdir=$(mktemp -d "${MIHOMO_BASE_DIR}/tmp/subscription-update.XXXXXX") || return 1
+    chmod 0700 "$tmpdir" || {
+        rm -rf "$tmpdir"
+        return 1
+    }
+    snapshot_dir="$tmpdir/snapshot"
+    mkdir "$snapshot_dir" || {
+        rm -rf "$tmpdir"
+        return 1
+    }
+    chmod 0700 "$snapshot_dir" || {
+        rm -rf "$tmpdir"
+        return 1
+    }
+    raw_candidate="$tmpdir/raw.candidate"
+    runtime_candidate="$tmpdir/runtime.candidate"
+    url_candidate="$tmpdir/url.candidate"
 
-    _rollback() {
-        _failcat '🍂' "$1"
-        # Restore backup using user permissions
-        cp "$MIHOMO_CONFIG_RAW_BAK" "$MIHOMO_CONFIG_RAW" 2>/dev/null
-        echo "[$(date +"%Y-%m-%d %H:%M:%S")] 订阅更新失败：$url" >> "${MIHOMO_UPDATE_LOG}"
+    _okcat '👌' '正在下载并验证新订阅配置...'
+    _download_config "$raw_candidate" "$url" || {
+        rm -rf "$tmpdir"
+        _failcat '🍂' '下载或转换失败，当前配置未改动' || true
+        return 1
+    }
+    _valid_config "$raw_candidate" || {
+        rm -rf "$tmpdir"
+        _failcat '🍂' '配置验证失败，当前配置未改动' || true
+        return 1
+    }
+    chmod 0600 "$raw_candidate" || {
+        rm -rf "$tmpdir"
         return 1
     }
 
-    _download_config "$MIHOMO_CONFIG_RAW" "$url" || { _rollback "下载失败：已回滚配置" || true; return 1; }
-    _valid_config "$MIHOMO_CONFIG_RAW" || { _rollback "转换失败：已回滚配置，转换日志：$BIN_SUBCONVERTER_LOG" || true; return 1; }
+    _config_snapshot "$MIHOMO_CONFIG_RAW" "$snapshot_dir" raw &&
+        _config_snapshot "$MIHOMO_CONFIG_RAW_BAK" "$snapshot_dir" raw-bak &&
+        _config_snapshot "$MIHOMO_CONFIG_RUNTIME" "$snapshot_dir" runtime &&
+        _config_snapshot "$MIHOMO_CONFIG_URL" "$snapshot_dir" url || {
+        rm -rf "$tmpdir"
+        return 1
+    }
+    _build_runtime_candidate "$raw_candidate" "$runtime_candidate" false || {
+        rm -rf "$tmpdir"
+        return 1
+    }
+    printf '%s\n' "$url" > "$url_candidate" || {
+        rm -rf "$tmpdir"
+        return 1
+    }
+    chmod 0600 "$runtime_candidate" "$url_candidate" || {
+        rm -rf "$tmpdir"
+        return 1
+    }
 
-    _merge_config_restart || return 1
+    is_mihomo_running && was_running=true
+    trap '_clashupdate_cleanup' EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    transaction_started=true
+
+    if [ "$was_running" = true ]; then
+        service_transitioned=true
+        _stop_mihomo_unlocked || return 1
+    fi
+    _config_publish raw "$raw_candidate" "$MIHOMO_CONFIG_RAW" || return 1
+    if _config_snapshot_present "$snapshot_dir" raw; then
+        _config_publish raw-bak "$snapshot_dir/raw.previous" "$MIHOMO_CONFIG_RAW_BAK" || return 1
+    fi
+    _config_publish runtime "$runtime_candidate" "$MIHOMO_CONFIG_RUNTIME" || return 1
+    _config_publish url "$url_candidate" "$MIHOMO_CONFIG_URL" || return 1
+
+    if [ "$was_running" = true ]; then
+        _activate_published_runtime_unlocked || return 1
+    fi
+
+    transaction_committed=true
+    trap - EXIT HUP INT TERM
+    _append_subscription_update_log 2>/dev/null ||
+        _failcat '🍂' '订阅已更新，但无法安全写入更新日志' || true
+    rm -rf "$tmpdir"
+)
+
+_clashupdate_locked() {
+    _clashupdate_apply_locked "$@" || return 1
+    _refresh_runtime_environment_unlocked
     _okcat '🍃' '订阅更新成功'
-    
-    # Save URL and log success using user permissions
-    mkdir -p "$(dirname "$MIHOMO_CONFIG_URL")"
-    echo "$url" > "$MIHOMO_CONFIG_URL"
-    echo "[$(date +"%Y-%m-%d %H:%M:%S")] 订阅更新成功：$url" >> "${MIHOMO_UPDATE_LOG}"
 }
 
+function clashupdate() {
+    local explicit_url=false url=
+
+    if [ "${1:-}" = auto ]; then
+        _failcat '为避免覆盖用户的并发 crontab 修改，本版本不再自动写入定时任务；请手动执行 clash update'
+        return 1
+    fi
+
+    case "$#" in
+    0) ;;
+    1)
+        case "$1" in
+        log)
+            if [ -f "$MIHOMO_UPDATE_LOG" ] && [ ! -L "$MIHOMO_UPDATE_LOG" ]; then
+                tail "$MIHOMO_UPDATE_LOG"
+            else
+                _failcat "暂无更新日志"
+            fi
+            return $?
+            ;;
+        *)
+            _is_valid_subscription_url "$1" || {
+                _failcat '订阅地址必须是不含空白的完整小写 http:// 或 https:// URL'
+                return 1
+            }
+            explicit_url=true
+            url=$1
+            ;;
+        esac
+        ;;
+    *)
+        _failcat '用法: clash update [URL|log]'
+        return 1
+        ;;
+    esac
+
+    # This check intentionally precedes lock acquisition, temp creation and
+    # downloading. Unsupported managed paths therefore cause zero side effects.
+    _subscription_update_paths_are_supported || {
+        _failcat '订阅受管配置包含符号链接或特殊文件，已拒绝更新且未改动任何配置'
+        return 1
+    }
+    if [ "$explicit_url" = false ] &&
+        [ ! -f "$MIHOMO_CONFIG_URL" ]; then
+        _failcat '未设置有效的订阅地址，请先执行 clash subscribe URL'
+        return 1
+    fi
+
+    _mihomo_run_locked _clashupdate_locked "$explicit_url" "$url"
+}
 function clashmixin() {
     case "$1" in
     -e)
@@ -771,6 +1482,10 @@ function clashctl() {
         shift
         clashupdate "$@"
         ;;
+    upgrade)
+        shift
+        clashupgrade "$@"
+        ;;
     tui)
         clashtui
         ;;
@@ -796,7 +1511,8 @@ Commands:
     mixin    [-e|-r]        Mixin 配置文件
     secret   [SECRET]       Web 控制台密钥
     subscribe [URL]         设置或查看订阅地址
-    update   [auto|log]     更新订阅配置
+    update   [URL|log]      手动更新订阅配置
+    upgrade  [rollback|status]     升级或回滚 mihomo 稳定版内核
 
 说明:
     • 用户空间运行，无需 sudo 权限

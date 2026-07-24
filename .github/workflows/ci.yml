@@ -1,0 +1,69 @@
+name: Test
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Install shell tooling
+        run: sudo apt-get update && sudo apt-get install --yes jq shellcheck zsh
+
+      - name: Check shell syntax
+        run: |
+          bash -n install.sh uninstall.sh script/*.sh tools/*.sh tests/*.sh
+          zsh -n install.sh uninstall.sh script/*.sh tests/*.zsh
+
+      - name: Run ShellCheck
+        run: |
+          shellcheck --severity=error install.sh uninstall.sh script/*.sh
+          shellcheck --severity=error tools/*.sh tests/*.sh
+
+      - name: Test bundle sync
+        run: tests/sync-mihomo.sh
+
+      - name: Test client upgrade transactions
+        run: |
+          tests/upgrade.sh
+          zsh tests/zsh-upgrade.zsh
+
+      - name: Test install and lifecycle integration
+        run: |
+          tests/auto-update.sh
+          tests/download-secrecy.sh
+          zsh tests/download-secrecy.sh
+          tests/integration.sh
+          tests/install-config-staging.sh
+          tests/lifecycle-regressions.sh
+          zsh tests/lifecycle-regressions.sh
+          tests/log-writer.sh
+          tests/process-instance.sh
+          zsh tests/process-instance.sh
+          tests/rc-cas.sh
+          zsh tests/rc-cas.sh
+          tests/script-refresh.sh
+          tests/security-defaults.sh
+          tests/subscription.sh
+          zsh tests/subscription.sh
+          tests/tui-download.sh
+          tests/uninstall.sh
+
+      - name: Verify bundled stable release
+        run: tests/bundle.sh

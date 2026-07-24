@@ -1,29 +1,49 @@
-name: Rebase arch branches to mater
+name: Rebase arch branches onto main
 
-on: 
+on:
   push:
     branches:
-      - master
+      - main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rebase-arch-branches
+  cancel-in-progress: false
 
 jobs:
-  build:
+  rebase:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
 
       - name: Configure Git
         run: |
-          git config --global user.name "GitHub Actions"
-          git config --global user.email "actions@github.com"
-      
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
       - name: Rebase and push
+        shell: bash
         run: |
-            for branch in $(git for-each-ref --format='%(refname:short)' refs/remotes/origin/arch*); do
-                git checkout ${branch#origin/}
-                git rebase master
-                git push --force
-            done
+          set -Eeuo pipefail
+
+          git fetch --prune origin \
+            '+refs/heads/main:refs/remotes/origin/main' \
+            '+refs/heads/arch*:refs/remotes/origin/arch*'
+          base_oid=$(git rev-parse refs/remotes/origin/main)
+
+          while IFS= read -r remote_ref; do
+            branch=${remote_ref#refs/remotes/origin/}
+            remote_oid=$(git rev-parse "$remote_ref")
+
+            git switch --detach "$remote_oid"
+            git rebase "$base_oid"
+            git push \
+              --force-with-lease="refs/heads/${branch}:${remote_oid}" \
+              origin "HEAD:refs/heads/${branch}"
+          done < <(git for-each-ref --format='%(refname)' 'refs/remotes/origin/arch*')

@@ -7,7 +7,9 @@ system-proxy:
 mode: rule
 
 # Web 控制台配置
-external-controller: "0.0.0.0:9090"
+# Keep the management API on loopback. install.sh replaces the empty template
+# secret below with a per-install random value before the first start.
+external-controller: "127.0.0.1:9090"
 external-ui: ui
 secret:
 
@@ -15,10 +17,6 @@ secret:
 allow-lan: false # 若开启务必设置用户验证以防暴露公网后被滥用
 authentication:
   # - "username:password" # 用户验证（clashon 会自动填充验证信息）
-
-# 自定义规则
-rules:
-  - DOMAIN,api64.ipify.org,DIRECT # 用于 clashui 获取真实公网 IP
 
 # tun 配置
 tun:
@@ -40,7 +38,7 @@ tun:
 # DNS 配置
 dns:
   enable: true
-  listen: 0.0.0.0:15353  # DNS listen port
+  listen: 127.0.0.1:15353  # Local resolver only; LAN proxy does not expose DNS
   enhanced-mode: fake-ip
   nameserver:
     - 114.114.114.114

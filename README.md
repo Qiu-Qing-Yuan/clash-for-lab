@@ -1,7 +1,7 @@
 # Clash for Lab - 实验室科学上网工具
 
-![GitHub License](https://img.shields.io/github/license/nelvko/clash-for-linux-install)
-![GitHub top language](https://img.shields.io/github/languages/top/nelvko/clash-for-linux-install)
+![GitHub License](https://img.shields.io/github/license/SaladDay/clash-for-lab)
+![GitHub top language](https://img.shields.io/github/languages/top/SaladDay/clash-for-lab)
 
 <table>
   <tr>
@@ -16,7 +16,7 @@
 
 ## 项目简介
 
-Clash for Lab 是专为实验室环境设计的科学上网解决方案，基于 [clash-for-linux-install](https://github.com/nelvko/clash-for-linux-install) 项目进行二次开发。
+Clash for Lab 是给无 sudo、无桌面环境的实验室服务器准备的 mihomo 管理工具。命令体验参考了 [clash-for-linux-install](https://github.com/nelvko/clash-for-linux-install)，内核同步和升级机制在本项目中独立实现。
 
 ### 为什么选择 Clash for Lab？
 
@@ -26,16 +26,18 @@ Clash for Lab 是专为实验室环境设计的科学上网解决方案，基于
 - **无 GUI 环境**：只能通过命令行操作，无法使用图形界面工具
 - **端口冲突频繁**：多用户共享服务器，常用端口经常被占用
 
-Clash for Lab 完美解决了这些问题。
+Clash for Lab 把安装、端口分配和日常管理都放在当前用户目录中完成。
 
 ### 核心特性
 
 - **用户空间运行**：无需 `sudo` 权限，安装到用户目录 `~/tools/mihomo/`
 - **智能端口管理**：自动检测端口冲突并分配可用端口，支持固定端口模式
-- **局域网访问控制**：支持开启/关闭局域网访问，方便多设备共享代理
+- **局域网访问控制**：支持按需开放代理端口；管理 API 和 DNS 默认仍只允许本机访问
 - **TUI 交互式界面**：终端下的图形化管理界面，实时监控流量和连接状态
 - **命令行操作**：完全基于命令行，适合无 GUI 环境
-- **多架构支持**：适配主流 Linux 发行版（CentOS、Debian、Ubuntu 等）
+- **稳定版内核**：CI 持续同步 mihomo 最新正式版，明确排除 Alpha 和预览版
+- **可校验升级**：支持 SHA256 校验、配置预检、失败回滚和手动退回上一版
+- **Linux amd64**：适配主流 x86_64 Linux 发行版（CentOS、Debian、Ubuntu 等）
 - **进程管理**：基于 PID 文件管理，无需 systemd 服务
 - **订阅转换**：自动使用 [subconverter](https://github.com/tindy2013/subconverter) 进行本地订阅转换
 
@@ -46,7 +48,9 @@ Clash for Lab 完美解决了这些问题。
 ### 环境要求
 
 - **用户权限**：普通用户权限即可，**无需 sudo 或 root**
-- **Shell 支持**：`bash`、`zsh`、`fish`
+- **系统与架构**：Linux amd64（x86_64）
+- **Shell 支持**：`bash`、`zsh`
+- **基础命令**：`curl`、`flock`、`gzip`、`tar`、`timeout`、`unzip` 和 SHA256 校验工具
 - **代理订阅**：需要有效的 Clash 订阅链接
 
 ### 安装步骤
@@ -54,10 +58,11 @@ Clash for Lab 完美解决了这些问题。
 #### 1. 克隆项目
 
 ```bash
-git clone https://ghfast.top/https://github.com/saladday/clash-for-lab.git
+git clone --depth 1 https://github.com/SaladDay/clash-for-lab.git
 cd clash-for-lab
 ```
-- 上述克隆命令使用了加速链接。如果无法访问，请尝试其他[可用链接](https://ghproxy.link/)，或直接下载压缩包进行安装。
+
+如果当前网络无法直连 GitHub，可以用你信任的镜像完成首次克隆；后续执行 `clash upgrade` 仍需访问 GitHub 官方 API、Git 和 Raw 端点，以免版本锁或可执行文件被重定向到其他来源。
 
 #### 2. 运行安装脚本
 
@@ -71,25 +76,15 @@ bash install.sh
 
 安装过程中会：
 
-- 自动检测系统架构
-- 下载适配的 mihomo 内核
+- 校验并安装仓库中由 CI 同步的 mihomo 最新稳定版
+- 在没有现成配置时提示输入订阅地址
 - 配置用户环境变量
 - 设置命令行别名
 - 检测并分配可用端口
+- 将管理 API 和 DNS 限制在本机，并为管理 API 生成独立的 64 个十六进制字符随机密钥
+- 启动 mihomo；任一步失败都会清理本次产生的半安装目录
 
-#### 3. 配置订阅
-
-安装完成后，设置你的代理订阅：
-
-```bash
-clash subscribe https://your-subscription-url
-```
-
-#### 4. 启动代理
-
-```bash
-clash on
-```
+安装完成后重新登录，或手动重新加载当前 Shell 的 RC 文件。以后更换订阅可使用 `clash subscribe URL`，启动和停止分别使用 `clash on`、`clash off`。
 
 ### 验证安装
 
@@ -128,7 +123,8 @@ Commands:
     mixin    [-e|-r]        Mixin 配置文件
     secret   [SECRET]       Web 控制台密钥
     subscribe [URL]         设置或查看订阅地址
-    update   [auto|log]     更新订阅配置
+    update   [URL|log]      手动更新订阅配置
+    upgrade  [rollback|status]     升级或回滚 mihomo 稳定版内核
 
 
 ```
@@ -198,10 +194,11 @@ clash lan off
 ```
 
 开启局域网访问后，其他设备可以通过以下方式使用代理：
+
 - HTTP 代理：`http://your-server-ip:port`
 - SOCKS5 代理：`socks5://your-server-ip:port`
 
-> 注意：开启局域网访问前，请确保网络环境安全，避免代理被未授权使用。
+> 注意：开启局域网访问前，请设置代理认证并确认网络环境可信，避免代理被未授权使用。该命令不会开放 Web 管理 API 或 DNS。
 
 #### 3.3 TUI 交互式界面
 
@@ -210,7 +207,9 @@ clash lan off
 clash tui
 ```
 
-TUI 界面基于 [clashctl](https://github.com/George-Miao/clashctl) 项目，首次使用时会自动下载。
+TUI 界面基于 [clashctl](https://github.com/George-Miao/clashctl) 项目，首次使用时会从本项目维护的
+[clashctl release](https://github.com/SaladDay/clashctl/releases) 下载正式版。下载器会拒绝草稿和预发布版，
+并核对 GitHub release 提供的文件大小与 SHA256 后再原子安装，不再经过第三方下载代理。
 
 功能特性：
 - 实时流量监控和图表展示
@@ -226,14 +225,22 @@ TUI 界面基于 [clashctl](https://github.com/George-Miao/clashctl) 项目，�
 # 查看控制台地址
 clash ui
 
-# 设置访问密钥（推荐）
+# 修改自动生成的访问密钥
 clash secret your-password
 
 # 查看当前密钥
 clash secret
 ```
 
-通过浏览器访问 Web 控制台可以：
+全新安装会为管理 API 生成随机密钥，并让管理 API 只监听 `127.0.0.1`。在服务器本机可直接打开 `clash ui` 显示的地址；从自己的电脑访问远程服务器时，先建立 SSH 隧道：
+
+```bash
+ssh -L 9090:127.0.0.1:9090 user@server
+```
+
+如果 `clash status` 显示的管理端口不是 9090，请把命令中的两个 9090 都替换为实际端口，然后在本机浏览器打开 `http://127.0.0.1:9090/ui`。无需在防火墙中放行管理端口。
+
+通过 Web 控制台可以：
 
 - 切换代理节点
 - 查看实时日志
@@ -251,14 +258,61 @@ clash subscribe
 
 # 更新订阅配置
 clash update
-
-# 设置自动更新（每2天）
-clash update auto
-
-# TODO:自定义更新天数
 ```
 
-#### 3.6 高级配置
+本项目不会自动改写用户的整份 `crontab`。这样可以避免与备份、证书续期等外部定时任务并发时丢失用户数据。
+如果旧版本曾通过 `clash update auto` 创建 `mihomoctl_auto_update` 条目，请使用 `crontab -e` 手动删除；
+订阅继续用 `clash update` 手动更新，内核稳定包则由本仓库的 GitHub Actions 自动同步。
+
+订阅更新先在临时文件中完成下载和内核校验，校验通过后再替换配置。更新失败时保留原配置。
+
+`clash update log` 只记录更新时间和结果，不记录订阅 URL 或令牌；更新日志权限为 `0600`，订阅转换器的原始输出不会落盘。如果服务原本处于停止状态，更新只发布新配置，不会擅自启动 mihomo。
+
+#### 3.6 内核升级
+
+`clash update` 用于更新订阅，内核更新使用单独的 `upgrade` 命令：
+
+```bash
+# 从 clash-for-lab 仓库升级到最新稳定版
+clash upgrade
+
+# 查看当前版本和可回滚版本
+clash upgrade status
+
+# 新版本不兼容时退回升级前的版本
+clash upgrade rollback
+```
+
+升级器先取得仓库 `main` 的 commit SHA，再从这个不可变 commit 下载版本锁和内核，避免 CI 更新期间读到两套版本。下载完成后会检查压缩包大小、SHA256、内核版本和当前配置。全部通过后才停止旧进程并替换内核；新内核启动失败时自动恢复旧版本。旧安装即使没有状态文件，首次升级也会先记录当前内核身份并保留到 rollback 槽。升级、订阅更新和启停命令共用一把文件锁，多个终端不会同时修改安装目录。
+
+升级器固定使用 GitHub 官方 API、Git 和 Raw 端点，并且只信任 `SaladDay/clash-for-lab` 的 `main` 分支；环境变量不能把版本锁或可执行文件重定向到其他仓库。
+
+mihomo 上游没有单独的 LTS 通道。本项目只同步 GitHub `releases/latest` 指向的正式稳定版，并再次检查 `draft=false`、`prerelease=false`，不会安装 `Prerelease-Alpha`。
+
+#### 操作边界
+
+安装目录归当前 Unix 用户所有，本项目把同一 UID 视为可信。请不要在 `clash` 命令运行期间手工替换 `~/tools/mihomo/` 下的配置、内核或管理脚本。命令开始时会拒绝关键路径上的符号链接和特殊文件，正常的并发命令由文件锁串行执行；不处理同一用户在命令执行中故意制造的路径切换、旧文件描述符写入或 TOCTOU 攻击。
+
+仓库维护者需要在 GitHub 的 Actions 设置中允许 `GITHUB_TOKEN` 写入仓库内容。如果 `main` 的 ruleset 禁止 Actions 直接推送，同步任务会按规则失败；需要由维护者明确允许 GitHub Actions 写入，或把发布步骤改成走 PR。同步任务本身不会强推或绕过已经前进的 `main`：验证期间只要分支发生变化，本轮发布就会失败并等待下一次定时任务。
+
+已经安装过旧版的用户，拉取本仓库新代码后可以先刷新管理脚本：
+
+```bash
+git pull
+bash install.sh --refresh
+```
+
+刷新时旧的管理脚本会完整移到 `~/tools/mihomo/script.recovery.*`，而不是直接删除。确认其中没有自定义内容后，可以手动清理这些目录。
+
+### 卸载
+
+```bash
+bash uninstall.sh
+```
+
+卸载脚本会先停止受管进程、清理 shell 入口，再删除标准安装目录 `~/tools/mihomo/`。安装中途失败时会清理本次新建的标准安装目录；如果进程或 shell 入口无法恢复，则保留现场并提示检查路径。
+
+#### 3.7 高级配置
 
 ```bash
 # 编辑自定义配置（Mixin）
@@ -273,7 +327,7 @@ clash tun on
 
 **Mixin 配置说明**：
 
-Mixin 配置文件（`~/tools/mihomo/config/mixin.yaml`）用于自定义代理行为，支持以下配置：
+Mixin 配置文件（`~/tools/mihomo/mixin.yaml`）用于自定义代理行为，支持以下配置：
 
 - `mode`：代理模式（rule/global/direct），默认为 rule 模式
 - `allow-lan`：局域网访问控制
@@ -281,6 +335,8 @@ Mixin 配置文件（`~/tools/mihomo/config/mixin.yaml`）用于自定义代理�
 - 其他高级配置项
 
 通过 Web UI 修改的配置（如代理模式）会在下次启动时保留。
+
+`clash on`、`restart`、`port` 和 `mixin` 都先生成并校验候选运行配置，再替换当前配置。失败时保留原配置和原来的运行状态。
 
 ## 项目结构
 
@@ -290,12 +346,17 @@ clash-for-lab/
 ├── uninstall.sh            # 卸载脚本
 ├── script/                 # 脚本目录
 │   ├── clashctl.sh         # 主控制脚本
-│   └── common.sh           # 公共函数库
+│   ├── common.sh           # 公共函数库
+│   ├── install-lib.sh      # 管理脚本原子发布
+│   ├── log-writer.sh       # 有大小上限的私有日志写入器
+│   └── upgrade.sh          # 稳定版内核升级与回滚
 ├── resources/              # 资源文件
-│   ├── config.yaml         # 默认配置模板
+│   ├── mihomo.lock.tsv     # CI 生成的稳定版版本锁
 │   ├── mixin.yaml          # Mixin 配置模板
 │   ├── Country.mmdb        # GeoIP 数据库
-│   └── bin/                # 预编译二进制文件
+│   └── zip/                # CI 维护的内核包及其他预编译资源
+├── tools/                  # CI 同步脚本
+├── tests/                  # 同步、安装包、升级和回归测试
 └── README.md               # 项目文档
 ```
 
@@ -306,15 +367,21 @@ clash-for-lab/
 ├── bin/                    # 二进制文件
 │   ├── mihomo              # 主程序
 │   ├── subconverter        # 订阅转换工具
+│   │   └── latest.log      # 私有占位文件；转换器原始输出不落盘
 │   ├── yq                  # YAML 处理工具
+│   ├── mihomo.previous     # 首次升级后保存的上一版内核
 │   └── clashctl-tui        # TUI 界面 (首次使用时自动下载)
 ├── config/                 # 配置文件
-│   ├── config.yaml         # 主配置文件
-│   ├── mixin.yaml          # 自定义配置
 │   ├── mihomo.pid          # 进程 ID 文件
-│   └── Country.mmdb        # GeoIP 数据库
+│   └── ports.conf          # 当前端口状态
+├── config.yaml             # 订阅配置
+├── mixin.yaml              # 自定义配置
+├── runtime.yaml            # 合并后的运行配置
+├── mihomoctl.log           # 不含订阅 URL/令牌的更新记录，权限 0600
+├── Country.mmdb            # GeoIP 数据库
 ├── logs/                   # 日志文件
-│   └── mihomo.log          # 运行日志
+│   └── mihomo.log          # 运行日志，权限 0600，硬上限 8 MiB
+├── state/                  # 当前与可回滚内核的包信息和二进制身份
 └── ui/                     # Web 控制台文件
 ```
 
@@ -334,11 +401,23 @@ A: 不建议。每个用户建议只运行一个实例，避免端口冲突和�
 
 ### Q: 如何更换订阅地址？
 
-A: 使用 `clash subscribe new-url` 命令更换，系统会自动更新配置。
+A: 使用 `clash subscribe new-url` 保存新地址，然后按提示立即更新，或稍后执行 `clash update`。
+
+### Q: 如何更新 mihomo 内核？
+
+A: 使用 `clash upgrade`。它只从本项目 GitHub 仓库获取 CI 校验过的正式稳定版；如需退回上一版，执行 `clash upgrade rollback`。
 
 ### Q: Web 控制台无法访问怎么办？
 
-A: 检查防火墙设置，确保控制台端口（默认 9090）可以访问。如果是远程访问，需要配置端口转发。
+A: 管理 API 默认只监听本机，这是预期行为。先用 `clash status` 确认实际管理端口，再从自己的电脑建立 `ssh -L 本地端口:127.0.0.1:管理端口 user@server` 隧道；不需要把管理端口暴露给公网。
+
+### Q: 旧安装如何采用新的本机监听默认值？
+
+A: `bash install.sh --refresh` 不会覆盖已有的自定义 Mixin。请执行 `clash mixin -e`，把 `external-controller` 改为 `127.0.0.1:端口`、`dns.listen` 改为 `127.0.0.1:端口`，再执行 `clash secret 新密钥`。保存 Mixin 后执行 `clash restart`。
+
+### Q: mihomo 日志会一直增长吗？
+
+A: 不会。管理脚本以 `0600` 创建日志，并将 `mihomo.log` 限制在 8 MiB；达到上限时会开始新的日志窗口，避免长期运行耗尽用户配额。
 
 ### Q: 如何让局域网内其他设备使用代理？
 
@@ -350,7 +429,7 @@ A: 不会。通过 Web UI 修改的代理模式（rule/global/direct）会自动
 
 ## 致谢
 
-本项目基于 [clash-for-linux-install](https://github.com/nelvko/clash-for-linux-install) 进行二次开发，感谢原作者的优秀工作。
+稳定版发现与命令体验参考了 [clash-for-linux-install](https://github.com/nelvko/clash-for-linux-install)。本项目的同步和升级代码为独立实现，感谢上游项目提供思路。
 
 ### 相关项目
 
