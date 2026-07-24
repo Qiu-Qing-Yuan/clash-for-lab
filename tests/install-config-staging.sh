@@ -307,8 +307,8 @@ printf '%s\n' "$subscription_url" | \
 grep -Eq '^secret: "[0-9a-f]{64}"$' \
     "$download_success_case/home/tools/mihomo/mixin.yaml" ||
     fail 'fresh install did not generate a unique API secret'
-mixin_mode=$(stat -f '%Lp' "$download_success_case/home/tools/mihomo/mixin.yaml" 2>/dev/null ||
-    stat -c '%a' "$download_success_case/home/tools/mihomo/mixin.yaml")
+mixin_mode=$(stat -c '%a' "$download_success_case/home/tools/mihomo/mixin.yaml" 2>/dev/null ||
+    stat -f '%Lp' "$download_success_case/home/tools/mihomo/mixin.yaml")
 [ "$mixin_mode" = 600 ] || fail 'installed mixin containing the API secret is not mode 0600'
 if find "$download_success_case/home/tools/mihomo/tmp" -name 'install-config.*' -print -quit | grep -q .; then
     fail 'successful install retained its config staging file'

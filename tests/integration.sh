@@ -741,7 +741,7 @@ if command -v flock >/dev/null 2>&1; then
     _is_bind() { return 0; }
     _upgrade_acquire_lock || fail 'failed to acquire converter inheritance test lock'
     _start_convert || fail 'failed to start converter inheritance fixture'
-    converter_log_mode=$(stat -f '%Lp' "$BIN_SUBCONVERTER_LOG" 2>/dev/null || stat -c '%a' "$BIN_SUBCONVERTER_LOG")
+    converter_log_mode=$(file_mode "$BIN_SUBCONVERTER_LOG")
     [ "$converter_log_mode" = 600 ] || fail 'converter log does not protect subscription details with mode 0600'
     _upgrade_release_lock
     if ! _upgrade_acquire_lock; then

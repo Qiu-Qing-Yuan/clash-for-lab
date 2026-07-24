@@ -27,7 +27,7 @@ grep -Fq 'entry-199-' "$log_file" || fail 'bounded writer did not retain the new
 if grep -Fq 'entry-000-' "$log_file"; then
     fail 'bounded writer retained the oldest output after crossing the limit'
 fi
-mode=$(stat -f '%Lp' "$log_file" 2>/dev/null || stat -c '%a' "$log_file")
+mode=$(stat -c '%a' "$log_file" 2>/dev/null || stat -f '%Lp' "$log_file")
 [ "$mode" = 600 ] || fail "log mode is $mode instead of 600"
 
 printf '%2048s\n' x | tr ' ' z | \
