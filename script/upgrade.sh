@@ -12,6 +12,7 @@ MIHOMO_UPGRADE_STATE_LOCK="${MIHOMO_UPGRADE_STATE_DIR}/mihomo.lock.tsv"
 MIHOMO_UPGRADE_PREVIOUS_STATE="${MIHOMO_UPGRADE_STATE_DIR}/mihomo.previous.lock.tsv"
 MIHOMO_UPGRADE_PREVIOUS="${MIHOMO_BASE_DIR}/bin/mihomo.previous"
 MIHOMO_UPGRADE_LOCK_DIR="${HOME}/.cache/clash-for-lab/mihomo-operation.lock"
+_UPGRADE_LOCK_METHOD=''
 
 _upgrade_info() {
     if command -v _okcat >/dev/null 2>&1; then
@@ -436,51 +437,87 @@ _upgrade_managed_file_ok() {
 }
 
 _upgrade_acquire_lock() {
-    local parent owner owner_file owner_tmp
-    command -v flock >/dev/null 2>&1 || {
-        _upgrade_fail "缺少升级锁依赖：flock"
-        return 1
-    }
+    local parent owner_file owner_tmp
+    command -v flock >/dev/null 2>&1 && _UPGRADE_LOCK_METHOD=flock
+
     parent=$(dirname "$MIHOMO_UPGRADE_LOCK_DIR")
-    owner_file="${MIHOMO_UPGRADE_LOCK_DIR}.owner"
     mkdir -p "$parent" || return 1
-    _upgrade_managed_file_ok "$MIHOMO_UPGRADE_LOCK_DIR" false false || return 1
-    _upgrade_managed_file_ok "$owner_file" false false || return 1
-    if [ ! -e "$MIHOMO_UPGRADE_LOCK_DIR" ]; then
-        (umask 077; : >> "$MIHOMO_UPGRADE_LOCK_DIR") || return 1
+
+    if [ "$_UPGRADE_LOCK_METHOD" = flock ]; then
+        owner_file="${MIHOMO_UPGRADE_LOCK_DIR}.owner"
+        _upgrade_managed_file_ok "$MIHOMO_UPGRADE_LOCK_DIR" false false || return 1
+        _upgrade_managed_file_ok "$owner_file" false false || return 1
+        if [ ! -e "$MIHOMO_UPGRADE_LOCK_DIR" ]; then
+            (umask 077; : >> "$MIHOMO_UPGRADE_LOCK_DIR") || return 1
+        fi
+        exec 9>>"$MIHOMO_UPGRADE_LOCK_DIR" || return 1
+        chmod 0600 "$MIHOMO_UPGRADE_LOCK_DIR" 2>/dev/null || true
+        if ! flock -n 9; then
+            exec 9>&-
+            _UPGRADE_LOCK_METHOD=''
+            return 1
+        fi
+    else
+        _UPGRADE_LOCK_METHOD=mkdir
+        local lock_dir="${MIHOMO_UPGRADE_LOCK_DIR}.d"
+        _upgrade_managed_file_ok "$lock_dir" false false || return 1
+        if ! mkdir "$lock_dir" 2>/dev/null; then
+            # Check for stale lock: if the owner PID is no longer alive,
+            # remove the lock directory and retry.
+            local stale_owner
+            stale_owner=$(cat "${lock_dir}/owner" 2>/dev/null || true)
+            if [ -n "$stale_owner" ] && ! kill -0 "$stale_owner" 2>/dev/null; then
+                rm -f "${lock_dir}/owner" 2>/dev/null || true
+                rmdir "$lock_dir" 2>/dev/null || true
+                if ! mkdir "$lock_dir" 2>/dev/null; then
+                    _UPGRADE_LOCK_METHOD=''
+                    return 1
+                fi
+            else
+                _UPGRADE_LOCK_METHOD=''
+                return 1
+            fi
+        fi
+        chmod 0700 "$lock_dir" 2>/dev/null || true
+        exec 9>/dev/null || return 1
+        owner_file="${lock_dir}/owner"
     fi
-    exec 9>>"$MIHOMO_UPGRADE_LOCK_DIR" || return 1
-    chmod 0600 "$MIHOMO_UPGRADE_LOCK_DIR" 2>/dev/null || true
-    if ! flock -n 9; then
-        exec 9>&-
-        return 1
-    fi
+
     owner=$(sh -c 'printf "%s\n" "$PPID"') || {
-        flock -u 9 2>/dev/null || true
-        exec 9>&-
+        _upgrade_release_lock
         return 1
     }
     owner_tmp=$(mktemp "${parent%/}/.mihomo-owner.XXXXXX") || {
-        flock -u 9 2>/dev/null || true
-        exec 9>&-
+        _upgrade_release_lock
         return 1
     }
     printf '%s\n' "$owner" > "$owner_tmp" && chmod 0600 "$owner_tmp" &&
         mv -f "$owner_tmp" "$owner_file" || {
         rm -f "$owner_tmp"
-        flock -u 9 2>/dev/null || true
-        exec 9>&-
+        _upgrade_release_lock
         return 1
     }
 }
 
 _upgrade_release_lock() {
+    if [ "${_UPGRADE_LOCK_METHOD:-}" = mkdir ]; then
+        local lock_dir="${MIHOMO_UPGRADE_LOCK_DIR}.d"
+        local owner_file="${lock_dir}/owner"
+        if [ -f "$owner_file" ] && [ ! -L "$owner_file" ]; then
+            rm -f "$owner_file"
+        fi
+        rmdir "$lock_dir" 2>/dev/null || true
+        exec 9>&-
+        _UPGRADE_LOCK_METHOD=''
+        return 0
+    fi
     local owner_file="${MIHOMO_UPGRADE_LOCK_DIR}.owner"
     if [ -f "$owner_file" ] && [ ! -L "$owner_file" ]; then
         rm -f "$owner_file"
     fi
     flock -u 9 2>/dev/null || true
     exec 9>&-
+    _UPGRADE_LOCK_METHOD=''
 }
 
 _upgrade_snapshot_file() {

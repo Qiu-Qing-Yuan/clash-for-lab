@@ -515,7 +515,7 @@ function _valid_upgrade_env() {
         ;;
     esac
     local required
-    for required in curl flock gzip timeout; do
+    for required in curl gzip timeout; do
         command -v "$required" >/dev/null 2>&1 || {
             _failcat "缺少安装依赖：$required"
             return 1
