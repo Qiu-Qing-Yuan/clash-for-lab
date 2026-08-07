@@ -1726,6 +1726,85 @@ function clashlog() {
     esac
 }
 
+MIHOMO_WATCHDOG_PID_FILE="${MIHOMO_BASE_DIR}/config/watchdog.pid"
+MIHOMO_WATCHDOG_INTERVAL=30
+
+_watchdog_is_running() {
+    local pid
+    pid=$(cat "$MIHOMO_WATCHDOG_PID_FILE" 2>/dev/null || true)
+    [ -n "$pid" ] && _process_is_current_user_live "$pid" 2>/dev/null
+}
+
+_watchdog_stop() {
+    local pid start_id exec_id
+    pid=$(cat "$MIHOMO_WATCHDOG_PID_FILE" 2>/dev/null || true)
+    [ -n "$pid" ] || return 0
+    _process_is_current_user_live "$pid" 2>/dev/null || {
+        rm -f "$MIHOMO_WATCHDOG_PID_FILE"
+        return 0
+    }
+    start_id=$(_process_start_id "$pid" 2>/dev/null || true)
+    kill "$pid" 2>/dev/null || true
+    local count=0
+    while _process_is_current_user_live "$pid" 2>/dev/null && [ "$count" -lt 50 ]; do
+        sleep 0.1
+        count=$((count + 1))
+    done
+    _process_is_current_user_live "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+    rm -f "$MIHOMO_WATCHDOG_PID_FILE"
+}
+
+function clashwatchdog() {
+    case "${1:-status}" in
+    on)
+        if _watchdog_is_running; then
+            _okcat '✅' '看门狗已在运行'
+            return 0
+        fi
+        local watchdog_script
+        watchdog_script="${MIHOMO_SCRIPT_DIR}/watchdog.sh"
+        [ -x "$watchdog_script" ] || watchdog_script="${SCRIPT_BASE_DIR}/watchdog.sh"
+        [ -x "$watchdog_script" ] || {
+            _failcat '缺少看门狗脚本'
+            return 1
+        }
+        nohup "$watchdog_script" "$MIHOMO_BASE_DIR" "$MIHOMO_WATCHDOG_INTERVAL" \
+            >/dev/null 2>&1 &
+        local wpid=$!
+        sleep 1
+        if _process_is_current_user_live "$wpid" 2>/dev/null; then
+            printf '%s\n' "$wpid" > "$MIHOMO_WATCHDOG_PID_FILE"
+            _okcat '✅' "看门狗已启动 (PID: $wpid)，每 ${MIHOMO_WATCHDOG_INTERVAL}s 检查一次"
+        else
+            _failcat '看门狗启动失败'
+            return 1
+        fi
+        ;;
+    off)
+        if _watchdog_is_running; then
+            _watchdog_stop
+            _okcat '✅' '看门狗已停止'
+        else
+            rm -f "$MIHOMO_WATCHDOG_PID_FILE" 2>/dev/null || true
+            _okcat '✅' '看门狗未运行'
+        fi
+        ;;
+    status)
+        if _watchdog_is_running; then
+            local pid
+            pid=$(cat "$MIHOMO_WATCHDOG_PID_FILE" 2>/dev/null || true)
+            _okcat '✅' "看门狗: 运行中 (PID: ${pid:-未知})"
+        else
+            _failcat '看门狗: 未运行'
+        fi
+        ;;
+    *)
+        _failcat '用法: clash watchdog [on|off|status]'
+        return 1
+        ;;
+    esac
+}
+
 function clashctl() {
     case "$1" in
     on)
@@ -1789,6 +1868,9 @@ function clashctl() {
     log)
         clashlog "$@"
         ;;
+    watchdog)
+        clashwatchdog "$@"
+        ;;
     *)
         cat <<EOF
 
@@ -1815,6 +1897,7 @@ Commands:
     update   [URL|log]      手动更新订阅配置
     upgrade  [rollback|status]     升级或回滚 mihomo 稳定版内核
     log      [N]            查看最近 N 行运行日志（默认 50）
+    watchdog [on|off|status]    进程崩溃自恢复
 
 说明:
     • 用户空间运行，无需 sudo 权限
