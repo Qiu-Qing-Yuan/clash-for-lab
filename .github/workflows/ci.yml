@@ -66,6 +66,8 @@ jobs:
           zsh tests/proxy-health.sh
           tests/connectivity.sh
           zsh tests/connectivity.sh
+          tests/subscribe-timeout.sh
+          zsh tests/subscribe-timeout.sh
           tests/subscription.sh
           zsh tests/subscription.sh
           tests/tui-download.sh

@@ -723,6 +723,7 @@ _download_raw_config() (
     local url=$2
     local agent='clash-verge/v2.0.4'
     local tmp
+    local sub_timeout=${MIHOMO_SUBSCRIBE_TIMEOUT:-60}
     umask 077
     tmp=$(mktemp 2>/dev/null) || tmp="${dest}.tmp.$$"
 
@@ -730,6 +731,7 @@ _download_raw_config() (
 
     # 订阅地址常见 302 跳转；同时需要对 4xx/5xx 做失败处理，避免写入 HTML/错误页导致后续解析失败。
     # 优先直连（历史行为），失败后再尝试走当前环境代理（mihomo 开启后可用）。
+    # 总超时可经 MIHOMO_SUBSCRIBE_TIMEOUT 环境变量调大，以适应弱网或大型订阅。
     if _curl_config_line url "$url" | curl \
         --disable \
         --silent \
@@ -739,7 +741,7 @@ _download_raw_config() (
         --max-redirs 5 \
         --compressed \
         --connect-timeout 10 \
-        --max-time 30 \
+        --max-time "$sub_timeout" \
         --retry 2 \
         --noproxy "*" \
         --user-agent "$agent" \
@@ -758,7 +760,7 @@ _download_raw_config() (
         --max-redirs 5 \
         --compressed \
         --connect-timeout 10 \
-        --max-time 30 \
+        --max-time "$sub_timeout" \
         --retry 2 \
         --user-agent "$agent" \
         --output "$tmp" \
@@ -769,7 +771,7 @@ _download_raw_config() (
 
     if command -v wget >/dev/null 2>&1 && printf '%s\n' "$url" | wget \
         --no-verbose \
-        --timeout 10 \
+        --timeout "$sub_timeout" \
         --tries 2 \
         --user-agent "$agent" \
         --output-document "$tmp" \
@@ -780,7 +782,7 @@ _download_raw_config() (
 
     if command -v wget >/dev/null 2>&1 && printf '%s\n' "$url" | wget \
         --no-verbose \
-        --timeout 10 \
+        --timeout "$sub_timeout" \
         --tries 1 \
         --no-proxy \
         --user-agent "$agent" \
@@ -985,7 +987,7 @@ _download_convert_config() {
             --show-error \
             --fail \
             --connect-timeout 5 \
-            --max-time 120 \
+            --max-time "${MIHOMO_SUBSCRIBE_TIMEOUT:-120}" \
             --noproxy "*" \
             --output "$convert_tmp" \
             --url "$base_url" \
