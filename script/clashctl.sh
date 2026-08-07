@@ -1698,6 +1698,34 @@ function clashdoctor() {
     fi
 }
 
+function clashlog() {
+    local log_file="$MIHOMO_BASE_DIR/logs/mihomo.log"
+    local lines=50
+
+    [ -f "$log_file" ] && [ ! -L "$log_file" ] || {
+        _failcat "日志文件不存在：$log_file"
+        return 1
+    }
+
+    case "${1:-}" in
+    ''|[0-9]*)
+        [ -z "${1:-}" ] || lines=$1
+        [[ $lines =~ ^[0-9]+$ ]] && [ "$lines" -ge 1 ] || {
+            _failcat "行数必须为正整数"
+            return 1
+        }
+        tail -n "$lines" "$log_file"
+        ;;
+    -f|--follow)
+        tail -f "$log_file"
+        ;;
+    *)
+        _failcat "用法: clash log [N|-f]（N 为行数，默认 50；-f 跟踪日志）"
+        return 1
+        ;;
+    esac
+}
+
 function clashctl() {
     case "$1" in
     on)
@@ -1758,6 +1786,9 @@ function clashctl() {
     doctor)
         clashdoctor
         ;;
+    log)
+        clashlog "$@"
+        ;;
     *)
         cat <<EOF
 
@@ -1783,6 +1814,7 @@ Commands:
     subscribe [URL]         设置或查看订阅地址
     update   [URL|log]      手动更新订阅配置
     upgrade  [rollback|status]     升级或回滚 mihomo 稳定版内核
+    log      [N]            查看最近 N 行运行日志（默认 50）
 
 说明:
     • 用户空间运行，无需 sudo 权限
