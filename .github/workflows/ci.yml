@@ -74,6 +74,8 @@ jobs:
           zsh tests/port-bind.sh
           tests/lock-fallback.sh
           zsh tests/lock-fallback.sh
+          tests/editor-fallback.sh
+          zsh tests/editor-fallback.sh
           tests/subscription.sh
           zsh tests/subscription.sh
           tests/tui-download.sh

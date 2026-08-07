@@ -1573,7 +1573,19 @@ function clashupdate() {
 function clashmixin() {
     case "$1" in
     -e)
-        vim "$MIHOMO_CONFIG_MIXIN" && {
+        local editor
+        editor=${EDITOR:-}
+        [ -n "$editor" ] && command -v "$editor" >/dev/null 2>&1 ||
+            editor=vim
+        command -v "$editor" >/dev/null 2>&1 ||
+            editor=vi
+        command -v "$editor" >/dev/null 2>&1 ||
+            editor=nano
+        command -v "$editor" >/dev/null 2>&1 || {
+            _failcat "未找到可用的编辑器（尝试了 EDITOR、vim、vi、nano）"
+            return 1
+        }
+        "$editor" "$MIHOMO_CONFIG_MIXIN" && {
             _merge_config_restart && _okcat "配置更新成功，已重启生效"
         }
         ;;
