@@ -144,6 +144,17 @@ fi
 # 设置二进制文件路径
 _set_bin
 
+install_validation_home="${MIHOMO_BASE_DIR}/tmp/install-validation-home"
+install_data_manifest="${MIHOMO_BASE_DIR}/tmp/install-validation-data.manifest"
+
+# Mihomo resolves GEO databases and relative provider paths from its HomeDir.
+# Install local data before validating a candidate stored under tmp/.
+for resource_data in "$RESOURCES_BASE_DIR"/*.mmdb "$RESOURCES_BASE_DIR"/*.dat; do
+    [ -f "$resource_data" ] || continue
+    cp "$resource_data" "$MIHOMO_BASE_DIR/" ||
+        _error_quit "安装配置数据失败：$resource_data"
+done
+
 # 仓库配置只作为只读输入；校验和下载在安装目录的临时文件中进行。
 install_config_candidate=$(mktemp "${MIHOMO_BASE_DIR}/tmp/install-config.XXXXXX") ||
     _error_quit "创建配置暂存文件失败"
@@ -151,7 +162,8 @@ url=""
 repo_config_usable=false
 if [ -f "$RESOURCES_CONFIG" ] &&
     cp "$RESOURCES_CONFIG" "$install_config_candidate" &&
-    _valid_config "$install_config_candidate"; then
+    _valid_config "$install_config_candidate" "$MIHOMO_BASE_DIR" \
+        "$install_validation_home"; then
     repo_config_usable=true
 fi
 
@@ -166,15 +178,20 @@ if [ "$repo_config_usable" != true ]; then
     if ! TMPDIR="${MIHOMO_BASE_DIR}/tmp" \
         TMP="${MIHOMO_BASE_DIR}/tmp" \
         TEMP="${MIHOMO_BASE_DIR}/tmp" \
-        _download_config "$install_config_candidate" "$url"; then
+        _download_config "$install_config_candidate" "$url" "$MIHOMO_BASE_DIR" \
+        "$install_validation_home"; then
         _error_quit "下载失败，请检查订阅地址后重试"
-    fi
-
-    if ! _valid_config "$install_config_candidate"; then
-        _error_quit "配置无效，请检查订阅内容或网络"
     fi
 fi
 _okcat '✅' '配置可用'
+
+_publish_new_config_validation_data "$install_validation_home" "$MIHOMO_BASE_DIR" \
+    "$install_data_manifest" ||
+    _error_quit "发布配置所需的离线数据失败"
+rm -rf "$install_validation_home" ||
+    _error_quit "清理配置验证目录失败"
+rm -f "$install_data_manifest" ||
+    _error_quit "清理配置数据发布记录失败"
 
 _config_atomic_copy "$install_config_candidate" "$MIHOMO_CONFIG_RAW" ||
     _error_quit "发布配置失败：$MIHOMO_CONFIG_RAW"
@@ -192,8 +209,6 @@ for resource_yaml in "$RESOURCES_BASE_DIR"/*.yaml; do
 done
 _install_secure_mixin "$MIHOMO_CONFIG_MIXIN" ||
     _error_quit "生成本机 Web 控制台密钥失败"
-cp "$RESOURCES_BASE_DIR"/*.mmdb "$MIHOMO_BASE_DIR/" 2>/dev/null || true
-cp "$RESOURCES_BASE_DIR"/*.dat "$MIHOMO_BASE_DIR/" 2>/dev/null || true
 
 # 解压 zashboard UI
 if ! unzip -q -o "$ZIP_UI" -d "$MIHOMO_BASE_DIR"; then

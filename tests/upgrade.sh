@@ -47,6 +47,23 @@ if ! command -v flock >/dev/null 2>&1; then
     flock() { return 0; }
 fi
 
+_valid_config() (
+    local config=$1 source_home=$2 validation_home=$3
+    [ -f "$config" ] && [ "$(wc -l < "$config")" -gt 1 ] || return 1
+    [ -d "$source_home" ] || return 1
+    mkdir -p "$validation_home" || return 1
+    timeout --kill-after=5 "${MIHOMO_CONFIG_TEST_TIMEOUT:-30}" \
+        "$BIN_KERNEL" -d "$validation_home" -f "$config" -t >/dev/null 2>&1 ||
+        return 1
+    [ "${VALIDATION_DOWNLOAD_DATA:-false}" != true ] ||
+        printf '%s\n' downloaded-during-validation > "$validation_home/GeoSite.dat"
+)
+
+_config_validation_data_is_installed() {
+    [ "${VALIDATION_DOWNLOAD_DATA:-false}" != true ] ||
+        [ -f "$2/GeoSite.dat" ]
+}
+
 _upgrade_platform() {
     UPGRADE_OS=linux
     UPGRADE_ARCH=amd64
@@ -81,7 +98,8 @@ new_case() {
     : > "$FETCH_LOG"
     : > "$SERVICE_LOG"
     printf 'stopped\n' > "$SERVICE_STATE"
-    unset START_FAIL_VERSION AFTER_PUBLISH_SIGNAL STATE_WRITE_FAIL_ON_CALL
+    unset START_FAIL_VERSION AFTER_PUBLISH_SIGNAL STATE_WRITE_FAIL_ON_CALL \
+        VALIDATION_DOWNLOAD_DATA
     STATE_WRITE_CALLS=0
 }
 
@@ -285,7 +303,7 @@ test_legacy_first_upgrade_retains_rollback() {
 }
 
 test_archive_and_candidate_validation() {
-    local bad_sha corrupt
+    local bad_sha corrupt validation_candidate
     new_case
     prepare_remote v2.0.0
     _upgrade_platform
@@ -303,10 +321,19 @@ test_archive_and_candidate_validation() {
     _upgrade_prepare_candidate "$ARCHIVE" "$FIXTURES/candidate" >/dev/null 2>&1 &&
         fail 'payload with the wrong actual version was accepted'
     prepare_remote v2.0.0 23
-    printf 'mixed-port: 7890\n' > "$MIHOMO_CONFIG_RUNTIME"
+    printf '%s\n' 'mixed-port: 7890' 'rules: []' > "$MIHOMO_CONFIG_RUNTIME"
     _upgrade_parse_manifest "$MANIFEST"
     _upgrade_prepare_candidate "$ARCHIVE" "$FIXTURES/candidate-config" >/dev/null 2>&1 &&
         fail 'payload rejecting the published config was accepted'
+    prepare_remote v2.0.0
+    validation_candidate="$FIXTURES/candidate-needs-new-data"
+    _upgrade_parse_manifest "$MANIFEST"
+    VALIDATION_DOWNLOAD_DATA=true
+    _upgrade_prepare_candidate "$ARCHIVE" "$validation_candidate" >/dev/null 2>&1 &&
+        fail 'upgrade accepted validation-only GEO data that startup would need to download again'
+    [ ! -e "${validation_candidate}.validation-home" ] ||
+        fail 'rejected upgrade retained its private validation HomeDir'
+    unset VALIDATION_DOWNLOAD_DATA
     return 0
 }
 

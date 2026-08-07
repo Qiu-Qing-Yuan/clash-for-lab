@@ -515,20 +515,196 @@ function _valid_install_env() {
     return 0
 }
 
-function _valid_config() {
-    [ -e "$1" ] && [ "$(wc -l <"$1")" -gt 1 ] || return 1
+_is_config_validation_data_name() {
+    local normalized_name
+    normalized_name=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]') || return 1
+    case "$normalized_name" in
+    country.mmdb|geoip.db|geoip.metadb|asn.mmdb|bundlemrs.7z|geoip.dat|geosite.dat)
+        return 0
+        ;;
+    *)
+        return 1
+        ;;
+    esac
+}
 
-    local msg
-    msg=$(timeout --kill-after=5 "${MIHOMO_CONFIG_TEST_TIMEOUT:-30}" \
-        "$BIN_KERNEL" -d "$(dirname "$1")" -f "$1" -t 2>&1) || {
+_copy_validation_data() {
+    local source=$1 destination=$2
+    if cp --reflink=auto -pL "$source" "$destination" 2>/dev/null; then
+        return 0
+    fi
+    rm -f "$destination"
+    cp -pL "$source" "$destination"
+}
+
+_seed_config_validation_home() {
+    local source_home=$1 validation_home=$2 source_data data_name
+    [ -d "$source_home" ] && [ -d "$validation_home" ] || return 1
+
+    # Mihomo may load or download these files while parsing GEO rules. Copy
+    # only parse-time data into the private HomeDir: runtime databases, logs,
+    # binaries and UI files are deliberately excluded.
+    for source_data in "$source_home"/*; do
+        [ -f "$source_data" ] || continue
+        data_name=$(basename "$source_data") || return 1
+        _is_config_validation_data_name "$data_name" || continue
+        _copy_validation_data "$source_data" "$validation_home/$data_name" || return 1
+    done
+}
+
+_initialize_config_validation_home() {
+    local source_home=$1 validation_home=$2 marker
+    marker="$validation_home/.clash-for-lab-validation-source"
+    if [ -e "$validation_home" ] || [ -L "$validation_home" ]; then
+        [ -d "$validation_home" ] && [ ! -L "$validation_home" ] || return 1
+    else
+        mkdir "$validation_home" || return 1
+    fi
+    chmod 0700 "$validation_home" || return 1
+    if [ -f "$marker" ] && [ ! -L "$marker" ]; then
+        [ "$(cat "$marker")" = "$source_home" ] || return 1
+        return 0
+    fi
+    [ ! -e "$marker" ] && [ ! -L "$marker" ] || return 1
+    _seed_config_validation_home "$source_home" "$validation_home" || return 1
+    printf '%s\n' "$source_home" > "$marker" || return 1
+    chmod 0600 "$marker"
+}
+
+_atomic_publish_new_validation_data() (
+    local source=$1 destination=$2 destination_dir temporary
+    _cleanup_validation_data_publish() {
+        [ -z "${temporary:-}" ] || rm -f "$temporary"
+    }
+    trap '_cleanup_validation_data_publish' EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    [ -f "$source" ] && [ ! -L "$source" ] || return 1
+    [ ! -e "$destination" ] && [ ! -L "$destination" ] || return 1
+    destination_dir=$(dirname "$destination") || return 1
+    temporary=$(mktemp "${destination_dir}/.mihomo-data.XXXXXX") || return 1
+    if _copy_validation_data "$source" "$temporary" &&
+        chmod 0644 "$temporary" &&
+        ln "$temporary" "$destination"; then
+        rm -f "$temporary" || return 1
+        temporary=''
+        trap - EXIT HUP INT TERM
+        return 0
+    fi
+    return 1
+)
+
+_publish_new_config_validation_data() {
+    local validation_home=$1 installed_home=$2 manifest=$3
+    local staged_data data_name destination
+    [ -d "$validation_home" ] && [ ! -L "$validation_home" ] ||
+        return 1
+    [ -d "$installed_home" ] && [ ! -L "$installed_home" ] ||
+        return 1
+    : > "$manifest" || return 1
+    chmod 0600 "$manifest" || return 1
+    for staged_data in "$validation_home"/*; do
+        [ -f "$staged_data" ] && [ ! -L "$staged_data" ] || continue
+        data_name=$(basename "$staged_data") || return 1
+        _is_config_validation_data_name "$data_name" || continue
+        destination="$installed_home/$data_name"
+        if [ -e "$destination" ] || [ -L "$destination" ]; then
+            continue
+        fi
+        # Record intent before publication so transaction cleanup also covers
+        # an interruption immediately after the atomic link.
+        printf '%s\n' "$data_name" >> "$manifest" || return 1
+        _atomic_publish_new_validation_data "$staged_data" "$destination" ||
+            return 1
+    done
+}
+
+_rollback_new_config_validation_data() {
+    local validation_home=$1 installed_home=$2 manifest=$3
+    local data_name staged_data destination rollback_status=0
+    [ -f "$manifest" ] && [ ! -L "$manifest" ] || return 0
+    while IFS= read -r data_name || [ -n "$data_name" ]; do
+        _is_config_validation_data_name "$data_name" || {
+            rollback_status=1
+            continue
+        }
+        staged_data="$validation_home/$data_name"
+        destination="$installed_home/$data_name"
+        if [ ! -e "$destination" ] && [ ! -L "$destination" ]; then
+            continue
+        fi
+        if [ -f "$destination" ] && [ ! -L "$destination" ] &&
+            [ -f "$staged_data" ] && [ ! -L "$staged_data" ] &&
+            cmp -s "$staged_data" "$destination"; then
+            rm -f "$destination" || rollback_status=1
+        else
+            rollback_status=1
+        fi
+    done < "$manifest"
+    return "$rollback_status"
+}
+
+_config_validation_data_is_installed() {
+    local validation_home=$1 installed_home=$2 staged_data data_name destination
+    [ -d "$installed_home" ] || return 1
+    [ -d "$validation_home" ] || return 0
+    for staged_data in "$validation_home"/*; do
+        [ -f "$staged_data" ] && [ ! -L "$staged_data" ] || continue
+        data_name=$(basename "$staged_data") || return 1
+        _is_config_validation_data_name "$data_name" || continue
+        destination="$installed_home/$data_name"
+        [ -f "$destination" ] && [ ! -L "$destination" ] || return 1
+    done
+}
+
+function _valid_config() (
+    local config=$1
+    local source_home=${2:-} requested_validation_home=${3:-}
+    local validation_home='' cleanup_validation_home=true validation_succeeded=false
+    local validation_safe_paths msg
+    [ -f "$config" ] && [ ! -L "$config" ] &&
+        [ "$(wc -l <"$config")" -gt 1 ] || return 1
+    [ -n "$source_home" ] || source_home=$(dirname "$config")
+    [ -d "$source_home" ] || return 1
+
+    umask 077
+    if [ -n "$requested_validation_home" ]; then
+        validation_home=$requested_validation_home
+        cleanup_validation_home=false
+    else
+        validation_home=$(mktemp -d "$(dirname "$config")/.mihomo-config-test.XXXXXX") ||
+            return 1
+    fi
+    _cleanup_validation_home() {
+        [ "$cleanup_validation_home" != true ] &&
+            [ "$validation_succeeded" = true ] ||
+            [ -z "$validation_home" ] ||
+            rm -rf "$validation_home"
+    }
+    trap '_cleanup_validation_home' EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    _initialize_config_validation_home "$source_home" "$validation_home" || return 1
+    # The pinned stable Mihomo loads GEO data during `-t`, but providers stay
+    # lazy. Keep GEO writes in validation_home while allowing existing config
+    # references below source_home to pass Mihomo's path safety check.
+    validation_safe_paths=$source_home
+    [ -z "${SAFE_PATHS:-}" ] ||
+        validation_safe_paths="${validation_safe_paths}:${SAFE_PATHS}"
+
+    msg=$(SAFE_PATHS="$validation_safe_paths" timeout --kill-after=5 "${MIHOMO_CONFIG_TEST_TIMEOUT:-30}" \
+        "$BIN_KERNEL" -d "$validation_home" -f "$config" -t 2>&1) || {
         if echo "$msg" | grep -qs "unsupport proxy type"; then
             _failcat "不支持的代理协议，请使用 mihomo 内核" || true
         fi
         return 1
     }
 
+    validation_succeeded=true
     return 0
-}
+)
 
 _curl_config_line() {
     local option=$1 value=$2 escaped
@@ -788,40 +964,333 @@ _download_tui() (
 
 _download_convert_config() {
     local dest=$1
-    local url=$2
+    local source=$2
     _start_convert || return 1
-    local base_url convert_url convert_status=0
+    local base_url convert_tmp curl_config convert_status=0
     base_url="http://127.0.0.1:${BIN_SUBCONVERTER_PORT}/sub"
-    convert_url=$(
-        {
-            _curl_config_line data-urlencode 'target=clash' || exit 1
-            _curl_config_line data-urlencode "url=$url" || exit 1
-        } | curl \
+    umask 077
+    convert_tmp=$(mktemp "${dest}.convert.XXXXXX" 2>/dev/null) || {
+        _stop_convert || true
+        return 1
+    }
+    curl_config=$(
+        _curl_config_line data-urlencode 'target=clash' &&
+            _curl_config_line data-urlencode "url=$source"
+    ) || convert_status=$?
+    if [ "$convert_status" -eq 0 ]; then
+        printf '%s\n' "$curl_config" | curl \
             --disable \
             --get \
             --silent \
-            --output /dev/null \
-            --write-out '%{url_effective}' \
+            --show-error \
+            --fail \
+            --connect-timeout 5 \
+            --max-time 120 \
+            --noproxy "*" \
+            --output "$convert_tmp" \
             --url "$base_url" \
-            --config -
-    ) || convert_status=$?
-    if [ "$convert_status" -eq 0 ] && [ -n "$convert_url" ]; then
-        _download_raw_config "$dest" "$convert_url" || convert_status=$?
-    else
-        [ "$convert_status" -ne 0 ] || convert_status=1
+            --config - || convert_status=$?
     fi
+    if [ "$convert_status" -eq 0 ]; then
+        mv -f "$convert_tmp" "$dest" || convert_status=$?
+    fi
+    rm -f "$convert_tmp"
     _stop_convert || convert_status=1
     return "$convert_status"
 }
+
+_read_single_proxy_link() (
+    local source=$1 link='' extra='' source_size first_status=0 second_status=0
+    [ -f "$source" ] && [ ! -L "$source" ] || return 1
+    source_size=$(wc -c < "$source" | tr -d '[:space:]') || return 1
+    case "$source_size" in
+    ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "$source_size" -le 65536 ] || return 1
+    exec 3< "$source" || return 1
+    IFS= read -r link <&3 || first_status=$?
+    IFS= read -r extra <&3 || second_status=$?
+    exec 3<&-
+    [ "$first_status" -eq 0 ] || [ -n "$link" ] || return 1
+    [ "$second_status" -ne 0 ] && [ -z "$extra" ] || return 1
+    link=${link%$'\r'}
+    case "$link" in
+    ss://*|ssr://*|vmess://*|vless://*|trojan://*|hysteria://*|hysteria2://*|hy2://*|anytls://*)
+        printf '%s' "$link"
+        ;;
+    *)
+        return 1
+        ;;
+    esac
+)
+
+_uri_percent_decode() {
+    # Decode one URI component without adding a Python/Perl dependency.
+    # Control bytes are not valid in the generated YAML scalars.
+    LC_ALL=C awk '
+        function hex_value(character, position) {
+            position = index("0123456789ABCDEF", toupper(character))
+            return position ? position - 1 : -1
+        }
+        {
+            if (NR != 1)
+                exit 2
+            for (index_in_value = 1; index_in_value <= length($0); index_in_value++) {
+                character = substr($0, index_in_value, 1)
+                if (character == "%") {
+                    if (index_in_value + 2 > length($0))
+                        exit 2
+                    high = hex_value(substr($0, index_in_value + 1, 1))
+                    low = hex_value(substr($0, index_in_value + 2, 1))
+                    if (high < 0 || low < 0)
+                        exit 2
+                    decoded = high * 16 + low
+                    if (decoded < 32 || decoded == 127)
+                        exit 2
+                    printf "%c", decoded
+                    index_in_value += 2
+                } else {
+                    if (character ~ /[[:cntrl:]]/)
+                        exit 2
+                    printf "%s", character
+                }
+            }
+        }
+        END {
+            if (NR != 1)
+                exit 2
+        }
+    '
+}
+
+_yaml_single_quote() {
+    LC_ALL=C sed "s/'/''/g; 1s/^/'/; \$s/\$/'/"
+}
+
+_convert_anytls_proxy_link() (
+    local dest=$1 link=$2 remainder authority password_encoded host_port
+    local server_encoded server port query='' fragment='' item key value
+    local sni='' insecure='' name group name_yaml server_yaml password_yaml sni_yaml
+    local more_query port_number query_item_count=0 tmp=''
+
+    case "$link" in
+    anytls://?*) remainder=${link#anytls://} ;;
+    *) return 1 ;;
+    esac
+    [ "${#link}" -le 8192 ] || return 1
+
+    case "$remainder" in
+    *'#'*)
+        fragment=${remainder#*#}
+        remainder=${remainder%%#*}
+        ;;
+    esac
+    case "$remainder" in
+    *'?'*)
+        query=${remainder#*\?}
+        remainder=${remainder%%\?*}
+        ;;
+    esac
+    [ "${#query}" -le 4096 ] || return 1
+
+    # The documented form uses "/?" but a link without the optional slash is
+    # also unambiguous. Other paths are rejected instead of being folded into
+    # the server name.
+    case "$remainder" in
+    */) authority=${remainder%/} ;;
+    *) authority=$remainder ;;
+    esac
+    case "$authority" in
+    *@*)
+        password_encoded=${authority%%@*}
+        host_port=${authority#*@}
+        ;;
+    *) return 1 ;;
+    esac
+    case "$host_port" in
+    ''|*/*|*@*) return 1 ;;
+    esac
+
+    password=$(printf '%s\n' "$password_encoded" | _uri_percent_decode) || return 1
+    [ -n "$password" ] || return 1
+
+    case "$host_port" in
+    \[*)
+        case "$host_port" in
+        *']'*) ;;
+        *) return 1 ;;
+        esac
+        server_encoded=${host_port#\[}
+        server_encoded=${server_encoded%%]*}
+        value=${host_port#*]}
+        case "$value" in
+        '') port=443 ;;
+        :*) port=${value#:} ;;
+        *) return 1 ;;
+        esac
+        ;;
+    *:*)
+        server_encoded=${host_port%:*}
+        port=${host_port##*:}
+        case "$server_encoded" in
+        *:*) return 1 ;;
+        esac
+        ;;
+    *)
+        server_encoded=$host_port
+        port=443
+        ;;
+    esac
+
+    server=$(printf '%s\n' "$server_encoded" | _uri_percent_decode) || return 1
+    case "$server" in
+    ''|*' '*|*/*|*@*|*'?'*|*'#'*|*\\*) return 1 ;;
+    esac
+    case "$port" in
+    ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "${#port}" -le 5 ] || return 1
+    port_number=$((10#$port))
+    [ "$port_number" -ge 1 ] && [ "$port_number" -le 65535 ] || return 1
+
+    while [ -n "$query" ]; do
+        query_item_count=$((query_item_count + 1))
+        [ "$query_item_count" -le 16 ] || return 1
+        case "$query" in
+        *'&'*)
+            item=${query%%&*}
+            query=${query#*&}
+            more_query=true
+            ;;
+        *)
+            item=$query
+            query=''
+            more_query=false
+            ;;
+        esac
+        case "$item" in
+        *=*)
+            key=${item%%=*}
+            value=${item#*=}
+            ;;
+        *)
+            key=$item
+            value=''
+            ;;
+        esac
+        case "$key" in
+        sni)
+            if [ -z "$sni" ]; then
+                sni=$(printf '%s\n' "$value" | _uri_percent_decode) || return 1
+            fi
+            ;;
+        insecure)
+            if [ -z "$insecure" ]; then
+                insecure=$(printf '%s\n' "$value" | _uri_percent_decode) || return 1
+                case "$insecure" in
+                0|1) ;;
+                *) return 1 ;;
+                esac
+            fi
+            ;;
+        esac
+        [ "$more_query" = true ] || break
+    done
+
+    case "$sni" in
+    *' '*|*/*|*@*|*'?'*|*'#'*|*\\*) return 1 ;;
+    esac
+    name=$(printf '%s\n' "$fragment" | _uri_percent_decode) || return 1
+    if [ -z "$name" ]; then
+        case "$server" in
+        *:*) name="[$server]:$port_number" ;;
+        *) name="$server:$port_number" ;;
+        esac
+    fi
+    case "$name" in
+    DIRECT|REJECT|REJECT-DROP|COMPATIBLE|PASS|PASS-RULE)
+        name="$name (AnyTLS)"
+        ;;
+    esac
+    group=PROXY
+    [ "$name" != "$group" ] || group=PROXY-GROUP
+
+    name_yaml=$(printf '%s\n' "$name" | _yaml_single_quote) || return 1
+    server_yaml=$(printf '%s\n' "$server" | _yaml_single_quote) || return 1
+    password_yaml=$(printf '%s\n' "$password" | _yaml_single_quote) || return 1
+    if [ -n "$sni" ]; then
+        sni_yaml=$(printf '%s\n' "$sni" | _yaml_single_quote) || return 1
+    fi
+
+    umask 077
+    tmp=$(mktemp "${dest}.anytls.XXXXXX" 2>/dev/null) || return 1
+    _cleanup_anytls_tmp() { [ -z "$tmp" ] || rm -f "$tmp"; }
+    trap '_cleanup_anytls_tmp' EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    (
+        printf '%s\n' 'proxies:' || exit 1
+        printf '  - name: %s\n' "$name_yaml" || exit 1
+        printf '%s\n' '    type: anytls' || exit 1
+        printf '    server: %s\n' "$server_yaml" || exit 1
+        printf '    port: %s\n' "$port_number" || exit 1
+        printf '    password: %s\n' "$password_yaml" || exit 1
+        printf '%s\n' '    udp: true' || exit 1
+        [ -z "$sni" ] || printf '    sni: %s\n' "$sni_yaml" || exit 1
+        [ "$insecure" != 1 ] || printf '%s\n' '    skip-cert-verify: true' || exit 1
+        printf '%s\n' 'proxy-groups:' || exit 1
+        printf "  - name: '%s'\n" "$group" || exit 1
+        printf '%s\n' '    type: select' '    proxies:' || exit 1
+        printf '      - %s\n' "$name_yaml" || exit 1
+        printf '%s\n' '      - DIRECT' 'rules:' || exit 1
+        printf "  - 'MATCH,%s'\n" "$group" || exit 1
+    ) > "$tmp" || return 1
+    chmod 0600 "$tmp" || return 1
+    mv -f "$tmp" "$dest" || return 1
+    tmp=''
+    trap - EXIT HUP INT TERM
+)
+
 function _download_config() {
     local dest=$1
     local url=$2
-    [ "${url:0:4}" = 'file' ] && return 0
+    local validation_home=${3:-} validation_sandbox=${4:-} proxy_link
+    [ -n "$validation_home" ] || validation_home=$(dirname "$dest")
+    if [ "${url:0:4}" = 'file' ]; then
+        _valid_config "$dest" "$validation_home" "$validation_sandbox"
+        return $?
+    fi
     _download_raw_config "$dest" "$url" || return 1
     _okcat '🍃' '下载成功：内核验证配置...'
-    _valid_config "$dest" || {
+    _valid_config "$dest" "$validation_home" "$validation_sandbox" || {
         _failcat '🍂' "验证失败：尝试订阅转换..."
-        _download_convert_config "$dest" "$url" ||
+        # Prefer data already downloaded so conversion survives a provider or
+        # network outage after the first successful request. The stable
+        # converter needs a direct URI for one-line subscriptions and a local
+        # file for encoded subscription bodies. The original URL remains the
+        # final compatibility fallback.
+        if proxy_link=$(_read_single_proxy_link "$dest"); then
+            case "$proxy_link" in
+            anytls://*)
+                if _convert_anytls_proxy_link "$dest" "$proxy_link" &&
+                    _valid_config "$dest" "$validation_home" "$validation_sandbox"; then
+                    return 0
+                fi
+                ;;
+            esac
+            if _download_convert_config "$dest" "$proxy_link" 2>/dev/null &&
+                _valid_config "$dest" "$validation_home" "$validation_sandbox"; then
+                return 0
+            fi
+        else
+            if _download_convert_config "$dest" "$dest" 2>/dev/null &&
+                _valid_config "$dest" "$validation_home" "$validation_sandbox"; then
+                return 0
+            fi
+        fi
+        _download_convert_config "$dest" "$url" &&
+            _valid_config "$dest" "$validation_home" "$validation_sandbox" ||
             _failcat '🍂' "转换失败：请检查订阅内容或网络"
     }
 }
@@ -1344,12 +1813,6 @@ _start_mihomo_unlocked() (
         _okcat "mihomo 进程已在运行"
         return 0
     fi
-
-    # Validate configuration before starting
-    _valid_config "$MIHOMO_CONFIG_RUNTIME" || {
-        _failcat "配置文件验证失败，无法启动 mihomo"
-        return 1
-    }
 
     log_writer="${MIHOMO_SCRIPT_DIR}/log-writer.sh"
     [ -x "$log_writer" ] || log_writer="${SCRIPT_BASE_DIR}/log-writer.sh"

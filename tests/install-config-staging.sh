@@ -89,6 +89,7 @@ prepare_case() {
         'secret:' \
         'dns:' \
         '  listen: 127.0.0.1:15353' > "$repo_dir/resources/mixin.yaml"
+    printf '%s\n' 'offline-geodata' > "$repo_dir/resources/Country.mmdb"
     : > "$repo_dir/resources/mihomo.lock.tsv"
     : > "$repo_dir/resources/zip/subconverter.tar.gz"
     : > "$repo_dir/resources/zip/yq.tar.gz"
@@ -117,6 +118,19 @@ _set_bin() {
     BIN_SUBCONVERTER_LOG="${MIHOMO_BASE_DIR}/logs/subconverter.log"
 }
 _valid_config() {
+    [ "${2:-}" = "$MIHOMO_BASE_DIR" ] || {
+        printf 'invalid-validation-home=%s\n' "${2:-missing}" >> "$FAKE_TRACE"
+        return 1
+    }
+    [ "${3:-}" = "${MIHOMO_BASE_DIR}/tmp/install-validation-home" ] || {
+        printf 'invalid-validation-sandbox=%s\n' "${3:-missing}" >> "$FAKE_TRACE"
+        return 1
+    }
+    mkdir -p "$3"
+    [ "$(cat "$MIHOMO_BASE_DIR/Country.mmdb" 2>/dev/null || true)" = offline-geodata ] || {
+        printf '%s\n' missing-offline-geodata >> "$FAKE_TRACE"
+        return 1
+    }
     case "$1" in
     "${MIHOMO_BASE_DIR}/tmp/"*) ;;
     *)
@@ -127,7 +141,11 @@ _valid_config() {
     grep -q '^valid:' "$1"
 }
 _download_config() {
-    local destination=$1 url=$2 download_temporary
+    local destination=$1 url=$2 validation_home=${3:-}
+    local validation_sandbox=${4:-} download_temporary
+    [ "$validation_home" = "$MIHOMO_BASE_DIR" ] || return 1
+    [ "$validation_sandbox" = "${MIHOMO_BASE_DIR}/tmp/install-validation-home" ] ||
+        return 1
     case "$destination" in
     "${MIHOMO_BASE_DIR}/tmp/"*) ;;
     *) return 1 ;;
@@ -143,6 +161,12 @@ _download_config() {
     rm -f "$download_temporary"
     printf 'valid: downloaded from %s\n' "$url" > "$destination"
     printf 'download-destination=%s\n' "$destination" >> "$FAKE_TRACE"
+    _valid_config "$destination" "$validation_home" "$validation_sandbox"
+}
+_publish_new_config_validation_data() {
+    [ "$1" = "${MIHOMO_BASE_DIR}/tmp/install-validation-home" ] || return 1
+    [ "$2" = "$MIHOMO_BASE_DIR" ] || return 1
+    : > "$3"
 }
 _okcat() { printf '%s\n' "$*"; }
 _failcat() { printf '%s\n' "$*" >&2; return 1; }

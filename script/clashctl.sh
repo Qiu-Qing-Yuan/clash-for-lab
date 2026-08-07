@@ -193,6 +193,7 @@ _build_runtime_candidate() {
     local mixin_config=${4:-$MIHOMO_CONFIG_MIXIN}
     local port_preference_mode=${5:-}
     local port_preference_value=${6:-}
+    local validation_sandbox=${7:-}
     "$BIN_YQ" eval-all '. as $item ireduce ({}; . *+ $item) | (.. | select(tag == "!!seq")) |= unique' \
         "$mixin_config" "$raw_config" "$mixin_config" > "$candidate" || {
         _failcat '合并配置失败'
@@ -200,7 +201,7 @@ _build_runtime_candidate() {
     }
     _resolve_port_conflicts "$candidate" "$show_ports" \
         "$port_preference_mode" "$port_preference_value" || return 1
-    _valid_config "$candidate" || {
+    _valid_config "$candidate" "$MIHOMO_BASE_DIR" "$validation_sandbox" || {
         _failcat '验证失败：请检查 Mixin 配置'
         return 1
     }
@@ -237,7 +238,8 @@ _clashon_locked() {
 }
 
 _runtime_rebuild_and_start_unlocked() (
-    local show_ports=$1 tmpdir candidate was_running=false
+    local show_ports=$1 tmpdir candidate validation_home validation_data_manifest
+    local was_running=false
     local transaction_started=false transaction_committed=false service_transitioned=false
 
     _runtime_transaction_cleanup() {
@@ -248,6 +250,8 @@ _runtime_rebuild_and_start_unlocked() (
             if [ "$service_transitioned" = true ] && is_mihomo_running; then
                 _stop_mihomo_unlocked >/dev/null 2>&1 || true
             fi
+            _rollback_new_config_validation_data "$validation_home" "$MIHOMO_BASE_DIR" \
+                "$validation_data_manifest" >/dev/null 2>&1 || true
             _config_restore "$MIHOMO_CONFIG_RUNTIME" "$tmpdir" runtime >/dev/null 2>&1 || true
             if [ "$service_transitioned" = true ]; then
                 if [ "$was_running" = true ]; then
@@ -271,11 +275,18 @@ _runtime_rebuild_and_start_unlocked() (
         return 1
     }
     candidate="$tmpdir/runtime.candidate"
+    validation_home="$tmpdir/validation-home"
+    validation_data_manifest="$tmpdir/validation-data.manifest"
+    _initialize_config_validation_home "$MIHOMO_BASE_DIR" "$validation_home" || {
+        rm -rf "$tmpdir"
+        return 1
+    }
     _config_snapshot "$MIHOMO_CONFIG_RUNTIME" "$tmpdir" runtime || {
         rm -rf "$tmpdir"
         return 1
     }
-    _build_runtime_candidate "$MIHOMO_CONFIG_RAW" "$candidate" "$show_ports" || {
+    _build_runtime_candidate "$MIHOMO_CONFIG_RAW" "$candidate" "$show_ports" \
+        "$MIHOMO_CONFIG_MIXIN" "" "" "$validation_home" || {
         rm -rf "$tmpdir"
         return 1
     }
@@ -294,6 +305,8 @@ _runtime_rebuild_and_start_unlocked() (
         service_transitioned=true
         _stop_mihomo_unlocked || return 1
     fi
+    _publish_new_config_validation_data "$validation_home" "$MIHOMO_BASE_DIR" \
+        "$validation_data_manifest" || return 1
     _config_publish runtime "$candidate" "$MIHOMO_CONFIG_RUNTIME" || return 1
     service_transitioned=true
     _activate_published_runtime_unlocked || return 1
@@ -846,7 +859,8 @@ _apply_mixin_change_locked() {
 
 _apply_mixin_change_unlocked() (
     local field=$1 value=$2
-    local tmpdir mixin_candidate runtime_candidate was_running=false
+    local tmpdir mixin_candidate runtime_candidate validation_home validation_data_manifest
+    local was_running=false
     local service_transitioned=false transaction_started=false transaction_committed=false
 
     _mixin_transaction_cleanup() {
@@ -857,6 +871,8 @@ _apply_mixin_change_unlocked() (
             if [ "$service_transitioned" = true ] && is_mihomo_running; then
                 _stop_mihomo_unlocked >/dev/null 2>&1 || true
             fi
+            _rollback_new_config_validation_data "$validation_home" "$MIHOMO_BASE_DIR" \
+                "$validation_data_manifest" >/dev/null 2>&1 || true
             _config_restore "$MIHOMO_CONFIG_MIXIN" "$tmpdir" mixin >/dev/null 2>&1 || true
             _config_restore "$MIHOMO_CONFIG_RUNTIME" "$tmpdir" runtime >/dev/null 2>&1 || true
             if [ "$service_transitioned" = true ]; then
@@ -882,6 +898,12 @@ _apply_mixin_change_unlocked() (
     }
     mixin_candidate="$tmpdir/mixin.candidate.yaml"
     runtime_candidate="$tmpdir/runtime.candidate.yaml"
+    validation_home="$tmpdir/validation-home"
+    validation_data_manifest="$tmpdir/validation-data.manifest"
+    _initialize_config_validation_home "$MIHOMO_BASE_DIR" "$validation_home" || {
+        rm -rf "$tmpdir"
+        return 1
+    }
     _config_snapshot "$MIHOMO_CONFIG_MIXIN" "$tmpdir" mixin || {
         rm -rf "$tmpdir"
         return 1
@@ -905,7 +927,8 @@ _apply_mixin_change_unlocked() (
         rm -rf "$tmpdir"
         return 1
     }
-    _build_runtime_candidate "$MIHOMO_CONFIG_RAW" "$runtime_candidate" false "$mixin_candidate" || {
+    _build_runtime_candidate "$MIHOMO_CONFIG_RAW" "$runtime_candidate" false \
+        "$mixin_candidate" "" "" "$validation_home" || {
         rm -rf "$tmpdir"
         return 1
     }
@@ -921,6 +944,8 @@ _apply_mixin_change_unlocked() (
         service_transitioned=true
         _stop_mihomo_unlocked || return 1
     fi
+    _publish_new_config_validation_data "$validation_home" "$MIHOMO_BASE_DIR" \
+        "$validation_data_manifest" || return 1
     _config_publish mixin "$mixin_candidate" "$MIHOMO_CONFIG_MIXIN" || return 1
     _config_publish runtime "$runtime_candidate" "$MIHOMO_CONFIG_RUNTIME" || return 1
     if [ "$was_running" = true ]; then
@@ -1231,6 +1256,7 @@ _read_subscription_url_snapshot() (
 _clashupdate_apply_locked() (
     local explicit_url=$1 url=${2:-}
     local tmpdir snapshot_dir raw_candidate runtime_candidate url_candidate
+    local validation_home validation_data_manifest
     local was_running=false service_transitioned=false
     local transaction_started=false transaction_committed=false
 
@@ -1242,6 +1268,9 @@ _clashupdate_apply_locked() (
             if [ "$service_transitioned" = true ] && is_mihomo_running; then
                 _stop_mihomo_unlocked >/dev/null 2>&1 || true
             fi
+            _rollback_new_config_validation_data "$validation_home" "$MIHOMO_BASE_DIR" \
+                "$validation_data_manifest" >/dev/null 2>&1 ||
+                restore_failed=true
             _config_restore "$MIHOMO_CONFIG_RAW" "$snapshot_dir" raw >/dev/null 2>&1 ||
                 restore_failed=true
             _config_restore "$MIHOMO_CONFIG_RAW_BAK" "$snapshot_dir" raw-bak >/dev/null 2>&1 ||
@@ -1295,16 +1324,18 @@ _clashupdate_apply_locked() (
     raw_candidate="$tmpdir/raw.candidate"
     runtime_candidate="$tmpdir/runtime.candidate"
     url_candidate="$tmpdir/url.candidate"
-
-    _okcat '👌' '正在下载并验证新订阅配置...'
-    _download_config "$raw_candidate" "$url" || {
+    validation_home="$tmpdir/validation-home"
+    validation_data_manifest="$tmpdir/validation-data.manifest"
+    _initialize_config_validation_home "$MIHOMO_BASE_DIR" "$validation_home" || {
         rm -rf "$tmpdir"
-        _failcat '🍂' '下载或转换失败，当前配置未改动' || true
         return 1
     }
-    _valid_config "$raw_candidate" || {
+
+    _okcat '👌' '正在下载并验证新订阅配置...'
+    _download_config "$raw_candidate" "$url" "$MIHOMO_BASE_DIR" \
+        "$validation_home" || {
         rm -rf "$tmpdir"
-        _failcat '🍂' '配置验证失败，当前配置未改动' || true
+        _failcat '🍂' '下载或转换失败，当前配置未改动' || true
         return 1
     }
     chmod 0600 "$raw_candidate" || {
@@ -1319,7 +1350,8 @@ _clashupdate_apply_locked() (
         rm -rf "$tmpdir"
         return 1
     }
-    _build_runtime_candidate "$raw_candidate" "$runtime_candidate" false || {
+    _build_runtime_candidate "$raw_candidate" "$runtime_candidate" false \
+        "$MIHOMO_CONFIG_MIXIN" "" "" "$validation_home" || {
         rm -rf "$tmpdir"
         return 1
     }
@@ -1343,6 +1375,8 @@ _clashupdate_apply_locked() (
         service_transitioned=true
         _stop_mihomo_unlocked || return 1
     fi
+    _publish_new_config_validation_data "$validation_home" "$MIHOMO_BASE_DIR" \
+        "$validation_data_manifest" || return 1
     _config_publish raw "$raw_candidate" "$MIHOMO_CONFIG_RAW" || return 1
     if _config_snapshot_present "$snapshot_dir" raw; then
         _config_publish raw-bak "$snapshot_dir/raw.previous" "$MIHOMO_CONFIG_RAW_BAK" || return 1

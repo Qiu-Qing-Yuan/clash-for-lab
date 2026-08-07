@@ -47,6 +47,8 @@ jobs:
       - name: Test install and lifecycle integration
         run: |
           tests/auto-update.sh
+          tests/config-validation.sh
+          zsh tests/config-validation.sh
           tests/download-secrecy.sh
           zsh tests/download-secrecy.sh
           tests/integration.sh

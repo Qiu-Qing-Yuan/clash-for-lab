@@ -53,19 +53,45 @@ _mihomo_run_locked() {
 _download_config() {
     destination=$1
     url=$2
+    [ "${3:-}" = "$MIHOMO_BASE_DIR" ] ||
+        fail 'subscription download did not use the installed HomeDir'
+    case "${4:-}" in
+    "$MIHOMO_BASE_DIR"/tmp/subscription-update.*/validation-home) ;;
+    *) fail 'subscription download did not use a transaction validation HomeDir' ;;
+    esac
     printf 'download\n' >> "$trace"
     printf '%s' "$url" > "$test_root/download.url"
     [ ! -f "$test_root/download.fail" ] || return 1
     printf 'downloaded:%s\n' "$url" > "$destination"
+    _valid_config "$destination" "$MIHOMO_BASE_DIR"
 }
 _valid_config() {
-    [ ! -f "$test_root/validation.fail" ] && grep -q '^downloaded:' "$1"
+    [ "${2:-}" = "$MIHOMO_BASE_DIR" ] &&
+        [ ! -f "$test_root/validation.fail" ] &&
+        grep -q '^downloaded:' "$1"
 }
 _build_runtime_candidate() {
     raw=$1
     destination=$2
+    case "${7:-}" in
+    "$MIHOMO_BASE_DIR"/tmp/subscription-update.*/validation-home) ;;
+    *) return 1 ;;
+    esac
     [ ! -f "$test_root/build.fail" ] || return 1
     printf 'runtime:%s\n' "$(cat "$raw")" > "$destination"
+}
+_publish_new_config_validation_data() {
+    case "$1" in
+    "$MIHOMO_BASE_DIR"/tmp/subscription-update.*/validation-home) ;;
+    *) return 1 ;;
+    esac
+    [ "$2" = "$MIHOMO_BASE_DIR" ] || return 1
+    : > "$3"
+}
+_rollback_new_config_validation_data() { return 0; }
+_initialize_config_validation_home() {
+    [ "$1" = "$MIHOMO_BASE_DIR" ] || return 1
+    mkdir -p "$2"
 }
 is_mihomo_running() {
     [ "$(cat "$service_state" 2>/dev/null || true)" = running ]

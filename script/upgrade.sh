@@ -231,14 +231,30 @@ _upgrade_verify_archive() {
     }
 }
 
-_upgrade_binary_accepts_published_config() {
-    local binary=$1 config
+_upgrade_binary_accepts_published_config() (
+    local binary=$1 config validation_home validation_status=0
+    validation_home="${binary}.validation-home"
+    _cleanup_upgrade_validation_home() {
+        rm -rf "$validation_home"
+    }
+    trap '_cleanup_upgrade_validation_home' EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    rm -rf "$validation_home" || return 1
     for config in "$MIHOMO_CONFIG_RUNTIME" "$MIHOMO_CONFIG_RAW"; do
         [ -f "$config" ] || continue
-        timeout --kill-after=5 "$MIHOMO_UPGRADE_TIMEOUT" \
-            "$binary" -d "$MIHOMO_BASE_DIR" -f "$config" -t >/dev/null 2>&1 || return 1
+        BIN_KERNEL="$binary" MIHOMO_CONFIG_TEST_TIMEOUT="$MIHOMO_UPGRADE_TIMEOUT" \
+            _valid_config "$config" "$MIHOMO_BASE_DIR" "$validation_home" ||
+            validation_status=1
+        [ "$validation_status" -eq 0 ] || break
     done
-}
+    if [ "$validation_status" -eq 0 ] &&
+        ! _config_validation_data_is_installed "$validation_home" "$MIHOMO_BASE_DIR"; then
+        validation_status=1
+    fi
+    return "$validation_status"
+)
 
 _upgrade_prepare_candidate() {
     local archive=$1 candidate=$2 version

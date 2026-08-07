@@ -91,6 +91,15 @@ _write_port_preferences_file() {
 _valid_config() {
     [ ! -f "$test_root/validation.fail" ] && [ -s "$1" ]
 }
+_initialize_config_validation_home() {
+    [ "$1" = "$MIHOMO_BASE_DIR" ] || return 1
+    mkdir -p "$2"
+}
+_publish_new_config_validation_data() {
+    [ "$2" = "$MIHOMO_BASE_DIR" ] || return 1
+    : > "$3"
+}
+_rollback_new_config_validation_data() { return 0; }
 _is_already_in_use() { return 1; }
 _has_tty() { return 0; }
 is_mihomo_running() {

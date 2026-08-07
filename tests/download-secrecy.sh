@@ -48,11 +48,13 @@ done
 config=$(mktemp)
 trap 'rm -f "$config"' EXIT HUP INT TERM
 cat > "$config"
-grep -Fq 'PROCESS_SECRET' "$config" || {
-    printf '%s\n' 'curl did not receive the secret through private stdin config' >&2
+if ! grep -Fq 'PROCESS_SECRET' "$config" &&
+    ! grep -Fq 'LOCAL_CONVERSION_SOURCE' "$config"; then
+    printf '%s\n' 'curl did not receive a recognized private stdin config' >&2
     exit 91
-}
+fi
 [ "${FAKE_CURL_FAIL:-false}" != true ] || exit 93
+[ -z "${FAKE_CURL_CALL_LOG:-}" ] || printf '%s\n' call >> "$FAKE_CURL_CALL_LOG"
 
 output=''
 write_effective=false
@@ -119,6 +121,8 @@ export PATH
 secret_url='https://provider.example/sub?token=PROCESS_SECRET'
 raw_dest="$test_root/raw.yaml"
 converted_dest="$test_root/converted.yaml"
+conversion_source="$test_root/LOCAL_CONVERSION_SOURCE"
+curl_call_log="$test_root/curl.calls"
 
 _download_raw_config "$raw_dest" "$secret_url" ||
     fail 'private curl-config raw download failed'
@@ -135,9 +139,31 @@ unset FAKE_CURL_FAIL
 BIN_SUBCONVERTER_PORT=25500
 _start_convert() { return 0; }
 _stop_convert() { return 0; }
-_download_convert_config "$converted_dest" "$secret_url" ||
+printf '%s\n' 'ss://local-source' > "$conversion_source"
+: > "$curl_call_log"
+FAKE_CURL_CALL_LOG=$curl_call_log
+export FAKE_CURL_CALL_LOG
+_download_convert_config "$converted_dest" "$conversion_source" ||
     fail 'private curl-config conversion download failed'
+unset FAKE_CURL_CALL_LOG
 grep -Fq 'proxies: []' "$converted_dest" || fail 'conversion did not publish output'
+[ "$(wc -l < "$curl_call_log" | tr -d '[:space:]')" = 1 ] ||
+    fail 'local conversion made more than one curl request'
+
+# A failed conversion must leave the downloaded snapshot intact and clean its
+# private temporary output so callers can safely try a compatibility fallback.
+printf '%s\n' 'original-download' > "$converted_dest"
+FAKE_CURL_FAIL=true
+export FAKE_CURL_FAIL
+if _download_convert_config "$converted_dest" "$conversion_source"; then
+    fail 'failed conversion was reported as successful'
+fi
+unset FAKE_CURL_FAIL
+[ "$(cat "$converted_dest")" = original-download ] ||
+    fail 'failed conversion replaced the downloaded snapshot'
+if find "$test_root" -name 'converted.yaml.convert.*' -print -quit | grep -q .; then
+    fail 'failed conversion retained a temporary output'
+fi
 
 # Subconverter request diagnostics can contain the full provider URL. Its raw
 # stdout/stderr must not be retained even in a private log.
