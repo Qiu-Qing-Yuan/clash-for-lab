@@ -70,6 +70,12 @@ cd clash-for-lab
 bash install.sh
 ```
 
+也可以通过 `--url` 参数直接传入订阅链接，跳过交互式输入：
+
+```bash
+bash install.sh --url 'https://your-subscription-url'
+```
+
 > 默认会安装在`~/tools/mihomo/`目录下
 
 * [ ] TODO: 自定义安装路径

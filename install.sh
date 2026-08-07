@@ -84,24 +84,47 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-if [ "${1:-}" = "--refresh" ]; then
-    _valid_upgrade_env || exit 1
-    _upgrade_acquire_lock || _error_quit "另一个 mihomo 操作正在运行"
-    INSTALL_LOCK_HELD=true
-    MIHOMO_OPERATION_LOCK_HELD=true
-    if [ ! -x "${MIHOMO_BASE_DIR}/bin/mihomo" ] || [ ! -f "${MIHOMO_SCRIPT_DIR}/common.sh" ]; then
-        _error_quit "未检测到完整安装，无法刷新管理脚本：$MIHOMO_BASE_DIR"
-    fi
-    if [ ! -x "${MIHOMO_BASE_DIR}/bin/yq" ]; then
-        _error_quit "已安装环境缺少 yq，无法启用内核升级：${MIHOMO_BASE_DIR}/bin/yq"
-    fi
-    _install_script_release || _error_quit "刷新管理脚本失败"
-    _upgrade_release_lock
-    INSTALL_LOCK_HELD=false
-    MIHOMO_OPERATION_LOCK_HELD=false
-    _okcat '✅' '管理脚本已刷新'
-    _okcat '💡' '重新登录后可使用 clash upgrade'
-    exit 0
+INSTALL_URL=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+    --refresh)
+        _valid_upgrade_env || exit 1
+        _upgrade_acquire_lock || _error_quit "另一个 mihomo 操作正在运行"
+        INSTALL_LOCK_HELD=true
+        MIHOMO_OPERATION_LOCK_HELD=true
+        if [ ! -x "${MIHOMO_BASE_DIR}/bin/mihomo" ] || [ ! -f "${MIHOMO_SCRIPT_DIR}/common.sh" ]; then
+            _error_quit "未检测到完整安装，无法刷新管理脚本：$MIHOMO_BASE_DIR"
+        fi
+        if [ ! -x "${MIHOMO_BASE_DIR}/bin/yq" ]; then
+            _error_quit "已安装环境缺少 yq，无法启用内核升级：${MIHOMO_BASE_DIR}/bin/yq"
+        fi
+        _install_script_release || _error_quit "刷新管理脚本失败"
+        _upgrade_release_lock
+        INSTALL_LOCK_HELD=false
+        MIHOMO_OPERATION_LOCK_HELD=false
+        _okcat '✅' '管理脚本已刷新'
+        _okcat '💡' '重新登录后可使用 clash upgrade'
+        exit 0
+        ;;
+    --url)
+        [ $# -ge 2 ] || _error_quit "--url 需要一个参数"
+        INSTALL_URL=$2
+        shift 2
+        ;;
+    --)
+        shift
+        break
+        ;;
+    *)
+        _error_quit "未知参数：$1（可用：--url <订阅地址>）"
+        ;;
+    esac
+done
+
+if [ -n "$INSTALL_URL" ]; then
+    _is_valid_subscription_url "$INSTALL_URL" ||
+        _error_quit "--url 订阅地址无效，必须是完整的小写 http:// 或 https:// URL"
 fi
 
 # 用于检查环境是否有效
@@ -169,8 +192,12 @@ fi
 
 if [ "$repo_config_usable" != true ]; then
     rm -f "$install_config_candidate" || _error_quit "清理无效配置暂存文件失败"
-    echo -n "$(_okcat '✈️ ' '输入订阅：')"
-    read -r url
+    if [ -n "$INSTALL_URL" ]; then
+        url=$INSTALL_URL
+    else
+        echo -n "$(_okcat '✈️ ' '输入订阅：')"
+        read -r url
+    fi
     _is_valid_subscription_url "$url" ||
         _error_quit "订阅地址无效，必须是完整的小写 http:// 或 https:// URL"
     _okcat '⏳' '正在下载...'
