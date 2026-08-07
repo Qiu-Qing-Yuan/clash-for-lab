@@ -70,6 +70,8 @@ jobs:
           zsh tests/subscribe-timeout.sh
           tests/install-url.sh
           zsh tests/install-url.sh
+          tests/port-bind.sh
+          zsh tests/port-bind.sh
           tests/subscription.sh
           zsh tests/subscription.sh
           tests/tui-download.sh

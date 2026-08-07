@@ -415,7 +415,32 @@ function _error_quit() {
 
 _is_bind() {
     local port=$1
-    { ss -lnptu || netstat -lnptu; } 2>/dev/null | grep ":${port}\b"
+    if command -v ss >/dev/null 2>&1; then
+        ss -lnptu 2>/dev/null | grep ":${port}\b"
+    elif command -v netstat >/dev/null 2>&1; then
+        netstat -lnptu 2>/dev/null | grep ":${port}\b"
+    elif [ -r /proc/net/tcp ]; then
+        _is_bind_proc_net "$port"
+    else
+        return 1
+    fi
+}
+
+# Fallback port-binding check via /proc/net/{tcp,tcp6,udp,udp6}.
+# Used when neither ss nor netstat is available.  Outputs a line if the
+# port is bound so callers that pipe _is_bind output (e.g.
+# _is_already_in_use) continue to work.  The output does not contain
+# process info, so _is_already_in_use conservatively treats any
+# match as "in use by someone else" — which is safe.
+_is_bind_proc_net() {
+    local port=$1 hex_port
+    hex_port=$(printf '%04X' "$port" 2>/dev/null) || return 1
+    awk -v p="$hex_port" '
+        FNR == 1 { next }
+        FILENAME ~ /tcp/ && $2 ~ (":" p "$") && $4 == "0A" { found=1 }
+        FILENAME ~ /udp/ && $2 ~ (":" p "$") { found=1 }
+        END { if (found) print "proc-net:" p; else exit 1 }
+    ' /proc/net/tcp /proc/net/tcp6 /proc/net/udp /proc/net/udp6 2>/dev/null
 }
 
 _is_already_in_use() {
