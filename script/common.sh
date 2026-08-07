@@ -2001,3 +2001,29 @@ _resolve_port_conflicts() {
 
     return 0
 }
+
+# ─── Proxy Environment Health ──────────────────────────────────────
+#
+# Pure predicates for diagnosing whether the current shell's proxy
+# environment variables are consistent with mihomo's live state.
+# Used by watch_proxy (shell startup), clash status, and clash doctor.
+
+# Return true if any proxy environment variable is set.
+_proxy_env_is_set() {
+    [ -n "${http_proxy:-}" ] || [ -n "${HTTP_PROXY:-}" ] ||
+        [ -n "${https_proxy:-}" ] || [ -n "${HTTPS_PROXY:-}" ] ||
+        [ -n "${all_proxy:-}" ] || [ -n "${ALL_PROXY:-}" ]
+}
+
+# Return true if the proxy URL in the environment points to a loopback
+# address (127.0.0.1, ::1, or localhost).  mihomo always binds to
+# loopback in userspace mode, so a loopback proxy that has no live
+# listener is almost certainly a stale mihomo variable.
+_proxy_env_is_loopback() {
+    local url
+    url=${http_proxy:-${HTTP_PROXY:-${all_proxy:-${ALL_PROXY:-}}}}
+    case "$url" in
+    *127.0.0.1*|*localhost*|*\[::1\]*) return 0 ;;
+    *) return 1 ;;
+    esac
+}

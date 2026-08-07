@@ -383,20 +383,77 @@ _verify_actual_ports() {
     fi
 }
 
-watch_proxy() {
-    # 新开交互式shell，且无代理变量时
-    [ -z "$http_proxy" ] && [[ $- == *i* ]] && {
-        # 检查用户是否启用系统代理
-        local system_proxy_status=$("$BIN_YQ" '.system-proxy.enable // true' "$MIHOMO_CONFIG_MIXIN" 2>/dev/null)
+# ─── Proxy Environment Health ──────────────────────────────────────
+#
+# Diagnose whether the current shell's proxy environment variables
+# are consistent with mihomo's live state.  Returns one of:
+#   inactive  – no proxy env vars set
+#   external  – proxy points to a non-loopback address (user's own)
+#   poisoned  – proxy points to loopback but mihomo is not running
+#   stale     – mihomo is running but the env var port doesn't match
+#   healthy   – everything is consistent
 
-        # 仅当用户启用系统代理且 mihomo 进程运行时，自动写入环境变量
+_proxy_env_diagnose() {
+    if ! _proxy_env_is_set; then
+        printf 'inactive\n'
+        return 0
+    fi
+    if ! _proxy_env_is_loopback; then
+        printf 'external\n'
+        return 0
+    fi
+    if ! is_mihomo_running; then
+        printf 'poisoned\n'
+        return 0
+    fi
+    # mihomo is running; verify the port in the env var matches the
+    # actual mihomo mixed-port recorded in the port state file.
+    _get_proxy_port 2>/dev/null || MIXED_PORT=
+    local url port
+    url=${http_proxy:-${HTTP_PROXY:-}}
+    port=${url##*:}
+    port=${port%%[/?]*}
+    case "$port" in
+    ''|*[!0-9]*) printf 'healthy\n'; return 0 ;;
+    esac
+    if [ -n "$MIXED_PORT" ] && [ "$port" != "$MIXED_PORT" ]; then
+        printf 'stale\n'
+        return 0
+    fi
+    printf 'healthy\n'
+}
+
+# Clear inherited loopback proxy variables when mihomo is no longer
+# running.  Called by watch_proxy on every new interactive shell to
+# prevent stale variables from causing silent connection failures.
+_watch_proxy_cleanup() {
+    if _proxy_env_is_loopback && ! is_mihomo_running; then
+        _unset_system_proxy
+    fi
+}
+
+watch_proxy() {
+    [[ $- == *i* ]] || return 0
+
+    local system_proxy_status
+    system_proxy_status=$("$BIN_YQ" '.system-proxy.enable // true' "$MIHOMO_CONFIG_MIXIN" 2>/dev/null)
+
+    if [ -z "${http_proxy:-}" ]; then
+        # New interactive shell without inherited proxy variables.
+        # Set them when the user has enabled system proxy and mihomo is live.
         if [ "$system_proxy_status" = "true" ] && is_mihomo_running; then
             _get_proxy_port
             _get_ui_port
             _get_dns_port
             _set_system_proxy
         fi
-    }
+    elif [ "$system_proxy_status" = "true" ]; then
+        # Proxy was inherited from a parent shell.  If system proxy is
+        # enabled, clear stale loopback variables to prevent silent
+        # connection failures.  If the user disabled system proxy,
+        # leave their environment untouched.
+        _watch_proxy_cleanup
+    fi
 }
 
 function clashoff() {
@@ -687,10 +744,56 @@ EOF
     esac
 }
 
+# Probe mihomo's management API and proxy port to verify end-to-end
+# connectivity.  Returns one of:
+#   ok          – both API and proxy are responding
+#   proxy_fail  – API responds but proxy cannot reach the internet
+#   api_fail    – proxy works but API is not responding
+#   down        – neither is responding
+#
+# Timeouts are short (2–5 s) so that clash status stays interactive.
+_connectivity_check() {
+    local ui_port=$1 proxy_port=$2 secret=${3:-}
+    local api_ok=false proxy_ok=false
+    local api_args
+
+    api_args=(
+        --disable --silent --show-error --fail
+        --connect-timeout 2 --max-time 3
+        --noproxy '*'
+        --output /dev/null
+    )
+    [ -n "$secret" ] && api_args+=(-H "Authorization: Bearer $secret")
+
+    curl "${api_args[@]}" "http://127.0.0.1:${ui_port}/version" 2>/dev/null &&
+        api_ok=true
+
+    curl --disable --silent --show-error --fail \
+        --connect-timeout 3 --max-time 5 \
+        --proxy "http://127.0.0.1:${proxy_port}" \
+        --noproxy '*' \
+        --output /dev/null \
+        'http://www.gstatic.com/generate_204' 2>/dev/null &&
+        proxy_ok=true
+
+    if [ "$api_ok" = true ] && [ "$proxy_ok" = true ]; then
+        printf 'ok\n'
+    elif [ "$api_ok" = true ]; then
+        printf 'proxy_fail\n'
+    elif [ "$proxy_ok" = true ]; then
+        printf 'api_fail\n'
+    else
+        printf 'down\n'
+    fi
+}
+
 function clashstatus() {
     local pid_file="$MIHOMO_BASE_DIR/config/mihomo.pid"
     local log_file="$MIHOMO_BASE_DIR/logs/mihomo.log"
     local pid='' managed_pids='' uptime=''
+    local probe=true
+
+    [ "${1:-}" = "--no-probe" ] && probe=false
 
     # Show subscription URL
     local subscription_url=$(cat "$MIHOMO_CONFIG_URL" 2>/dev/null)
@@ -728,6 +831,19 @@ function clashstatus() {
             _okcat "代理端口: $MIXED_PORT"
             _okcat "管理端口: $UI_PORT"
             _okcat "DNS端口: $DNS_PORT"
+
+            # Connectivity probe
+            if [ "$probe" = true ]; then
+                local secret connectivity
+                secret=$("$BIN_YQ" '.secret // ""' "$MIHOMO_CONFIG_RUNTIME" 2>/dev/null)
+                connectivity=$(_connectivity_check "$UI_PORT" "$MIXED_PORT" "$secret")
+                case "$connectivity" in
+                ok)         _okcat '✅' '连通性: 正常' ;;
+                proxy_fail) _failcat '⚠️' '连通性: 代理端口可达但无法出网' || true ;;
+                api_fail)   _failcat '⚠️' '连通性: 代理正常但管理 API 不可达' || true ;;
+                down)       _failcat '❌' '连通性: 代理端口和管理 API 均不可达' || true ;;
+                esac
+            fi
         else
             _failcat "配置文件不存在，无法获取端口信息"
         fi
@@ -737,6 +853,9 @@ function clashstatus() {
     else
         _failcat "mihomo 进程状态: 未运行"
         [ ! -f "$pid_file" ] || _failcat "检测到 PID 文件；状态查询不会自动清理" || true
+        if _proxy_env_is_set && _proxy_env_is_loopback; then
+            _failcat "⚠️ 当前终端代理变量指向已停止的 mihomo，执行 clash doctor 修复" || true
+        fi
         return 1
     fi
 }
@@ -1467,6 +1586,106 @@ function clashmixin() {
     esac
 }
 
+function clashdoctor() {
+    local diagnosis issues=0 fixed=0
+
+    _okcat '🔍' '代理环境诊断'
+
+    # 1. Process status
+    if is_mihomo_running; then
+        local pid
+        pid=$(cat "$MIHOMO_BASE_DIR/config/mihomo.pid" 2>/dev/null || true)
+        _okcat '✅' "mihomo 进程: 运行中 (PID: ${pid:-未知})"
+    else
+        _failcat '❌' 'mihomo 进程: 未运行' || true
+        issues=$((issues + 1))
+    fi
+
+    # 2. Proxy environment diagnosis
+    diagnosis=$(_proxy_env_diagnose)
+    case "$diagnosis" in
+    healthy)
+        _okcat '✅' '代理环境变量: 正常'
+        ;;
+    inactive)
+        if is_mihomo_running; then
+            _failcat '⚠️' '代理环境变量: 未设置 (mihomo 运行中，建议 clash proxy on)' || true
+            issues=$((issues + 1))
+        else
+            _okcat '✅' '代理环境变量: 未设置'
+        fi
+        ;;
+    poisoned)
+        _failcat '❌' '代理环境变量: 指向已停止的 mihomo (中毒)' || true
+        issues=$((issues + 1))
+        ;;
+    stale)
+        _failcat '⚠️' '代理环境变量: 端口与当前 mihomo 不一致' || true
+        issues=$((issues + 1))
+        ;;
+    external)
+        _okcat 'ℹ️' '代理环境变量: 指向非本机代理 (不干预)'
+        ;;
+    esac
+
+    # 3. Port bindings (only if mihomo is running)
+    if is_mihomo_running; then
+        _get_proxy_port 2>/dev/null || true
+        _get_ui_port 2>/dev/null || true
+        _get_dns_port 2>/dev/null || true
+
+        if _is_bind "$MIXED_PORT" >/dev/null 2>&1; then
+            _okcat '✅' "代理端口 ${MIXED_PORT}: 监听中"
+        else
+            _failcat '❌' "代理端口 ${MIXED_PORT}: 未监听" || true
+            issues=$((issues + 1))
+        fi
+
+        if _is_bind "$UI_PORT" >/dev/null 2>&1; then
+            _okcat '✅' "管理端口 ${UI_PORT}: 监听中"
+        else
+            _failcat '❌' "管理端口 ${UI_PORT}: 未监听" || true
+            issues=$((issues + 1))
+        fi
+    fi
+
+    # 4. Auto-fix
+    if [ "$issues" -gt 0 ]; then
+        _okcat '🔧' "发现 $issues 个问题，正在修复..."
+
+        case "$diagnosis" in
+        poisoned)
+            _unset_system_proxy
+            _okcat '✅' '已清除当前终端的过期代理环境变量'
+            fixed=$((fixed + 1))
+            ;;
+        stale)
+            if is_mihomo_running; then
+                _get_proxy_port 2>/dev/null || true
+                _get_ui_port 2>/dev/null || true
+                _get_dns_port 2>/dev/null || true
+                if _set_system_proxy 2>/dev/null; then
+                    _okcat '✅' '已刷新当前终端的代理环境变量'
+                    fixed=$((fixed + 1))
+                else
+                    _failcat '❌' '无法刷新代理环境变量' || true
+                fi
+            fi
+            ;;
+        esac
+
+        if ! is_mihomo_running; then
+            _okcat '💡' '执行 clash on 启动代理服务'
+        fi
+
+        local remaining=$((issues - fixed))
+        [ "$remaining" -le 0 ] ||
+            _okcat 'ℹ️' "还有 $remaining 个问题需要手动处理"
+    else
+        _okcat '✅' '一切正常'
+    fi
+}
+
 function clashctl() {
     case "$1" in
     on)
@@ -1524,6 +1743,9 @@ function clashctl() {
     tui)
         clashtui
         ;;
+    doctor)
+        clashdoctor
+        ;;
     *)
         cat <<EOF
 
@@ -1536,7 +1758,8 @@ Commands:
     on                      开启代理
     off                     关闭代理
     restart                 重启代理服务
-    status                  进程运行状态
+    status  [--no-probe]    进程运行状态与连通性检测
+    doctor                  诊断并修复代理环境
     tui                     交互式终端界面（TUI）
     ui                      Web 控制台地址
     proxy    [on|off|status]       系统代理环境变量

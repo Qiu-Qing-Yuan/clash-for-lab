@@ -62,6 +62,10 @@ jobs:
           zsh tests/rc-cas.sh
           tests/script-refresh.sh
           tests/security-defaults.sh
+          tests/proxy-health.sh
+          zsh tests/proxy-health.sh
+          tests/connectivity.sh
+          zsh tests/connectivity.sh
           tests/subscription.sh
           zsh tests/subscription.sh
           tests/tui-download.sh

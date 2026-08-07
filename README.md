@@ -118,6 +118,7 @@ Commands:
     ui                      Web 控制台地址
     tui                     TUI 交互式界面
     status                  进程运行状态
+    doctor                  诊断并修复代理环境
     tun      [on|off|status]       Tun 模式 (需要权限)
     lan      [on|off|status]       局域网访问控制
     mixin    [-e|-r]        Mixin 配置文件
@@ -388,6 +389,12 @@ clash-for-lab/
 ```
 
 ## 常见问题
+
+### Q: 代理突然不能用，但 clash status 显示进程在运行？
+
+A: mihomo 进程可能已被停止（如被 OOM Killer 杀掉），但当前终端仍持有旧的代理环境变量。执行 `clash doctor` 诊断并自动清除过期的代理变量。新开的终端会自动检测并清除。
+
+`clash status` 现在包含连通性探测，会检查管理 API 和代理端口的实际可达性。如果探测拖慢了状态查询，可以使用 `clash status --no-probe` 跳过。
 
 ### Q: SSH 断开后代理服务会停止吗？
 
