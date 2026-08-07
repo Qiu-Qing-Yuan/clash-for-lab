@@ -78,6 +78,8 @@ jobs:
           zsh tests/editor-fallback.sh
           tests/log-cmd.sh
           zsh tests/log-cmd.sh
+          tests/download-error.sh
+          zsh tests/download-error.sh
           tests/subscription.sh
           zsh tests/subscription.sh
           tests/tui-download.sh

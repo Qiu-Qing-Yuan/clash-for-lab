@@ -743,56 +743,52 @@ _curl_config_line() {
     printf '%s = "%s"\n' "$option" "$escaped"
 }
 
+# Provide a human-readable hint based on curl's exit code.
+# See https://everything.curl.dev/cmdline/exitcodes
+_download_error_hint() {
+    local rc=$1 url=$2
+    case "$rc" in
+    6)  _failcat '🍂' "DNS 解析失败：无法解析订阅地址域名" ;;
+    7)  _failcat '🍂' "无法连接到订阅服务器" ;;
+    28) _failcat '🍂' "下载超时：订阅服务器响应过慢或网络不通" ;;
+    22) _failcat '🍂' "订阅服务器返回 HTTP 错误（如 404 或 403）：订阅地址可能已过期或失效" ;;
+    35|51|53|54|55|58|60|64|66|77|80|82|83|90) _failcat '🍂' "TLS/SSL 错误：订阅服务器的证书有问题或不受信任" ;;
+    *)  _failcat '🍂' "下载失败（curl 退出码 ${rc}）" ;;
+    esac
+}
+
 _download_raw_config() (
     local dest=$1
     local url=$2
     local agent='clash-verge/v2.0.4'
     local tmp
     local sub_timeout=${MIHOMO_SUBSCRIBE_TIMEOUT:-60}
+    local curl_rc
     umask 077
     tmp=$(mktemp 2>/dev/null) || tmp="${dest}.tmp.$$"
 
     _cleanup_tmp() { rm -f "$tmp"; }
+    _curl_noproxy() {
+        _curl_config_line url "$url" | curl \
+            --disable --silent --show-error --fail --location \
+            --max-redirs 5 --compressed --connect-timeout 10 \
+            --max-time "$sub_timeout" --retry 2 --noproxy "*" \
+            --user-agent "$agent" --output "$tmp" --config -
+    }
+    _curl_proxy() {
+        _curl_config_line url "$url" | curl \
+            --disable --silent --show-error --fail --location \
+            --max-redirs 5 --compressed --connect-timeout 10 \
+            --max-time "$sub_timeout" --retry 2 \
+            --user-agent "$agent" --output "$tmp" --config -
+    }
 
-    # 订阅地址常见 302 跳转；同时需要对 4xx/5xx 做失败处理，避免写入 HTML/错误页导致后续解析失败。
     # 优先直连（历史行为），失败后再尝试走当前环境代理（mihomo 开启后可用）。
     # 总超时可经 MIHOMO_SUBSCRIBE_TIMEOUT 环境变量调大，以适应弱网或大型订阅。
-    if _curl_config_line url "$url" | curl \
-        --disable \
-        --silent \
-        --show-error \
-        --fail \
-        --location \
-        --max-redirs 5 \
-        --compressed \
-        --connect-timeout 10 \
-        --max-time "$sub_timeout" \
-        --retry 2 \
-        --noproxy "*" \
-        --user-agent "$agent" \
-        --output "$tmp" \
-        --config -; then
-        mv -f "$tmp" "$dest"
-        return 0
-    fi
+    curl_rc=0
+    _curl_noproxy 2>/dev/null && { mv -f "$tmp" "$dest"; return 0; } || curl_rc=$?
 
-    if _curl_config_line url "$url" | curl \
-        --disable \
-        --silent \
-        --show-error \
-        --fail \
-        --location \
-        --max-redirs 5 \
-        --compressed \
-        --connect-timeout 10 \
-        --max-time "$sub_timeout" \
-        --retry 2 \
-        --user-agent "$agent" \
-        --output "$tmp" \
-        --config -; then
-        mv -f "$tmp" "$dest"
-        return 0
-    fi
+    _curl_proxy 2>/dev/null && { mv -f "$tmp" "$dest"; return 0; } || curl_rc=$?
 
     if command -v wget >/dev/null 2>&1 && printf '%s\n' "$url" | wget \
         --no-verbose \
@@ -818,6 +814,7 @@ _download_raw_config() (
     fi
 
     _cleanup_tmp
+    _download_error_hint "$curl_rc" "$url"
     return 1
 )
 
