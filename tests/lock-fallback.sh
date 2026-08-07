@@ -29,9 +29,9 @@ set -u
     _upgrade_acquire_lock || fail 'lock acquisition failed'
     [ -n "$_UPGRADE_LOCK_METHOD" ] || fail 'lock method not set'
 
-    # Second acquire should fail
+    # Second acquire should fail while the first is still held
     if _upgrade_acquire_lock 2>/dev/null; then
-        fail 'second lock acquisition should fail'
+        fail 'second lock acquisition should fail while first is held'
     fi
 
     _upgrade_release_lock

@@ -13,6 +13,8 @@ MIHOMO_UPGRADE_PREVIOUS_STATE="${MIHOMO_UPGRADE_STATE_DIR}/mihomo.previous.lock.
 MIHOMO_UPGRADE_PREVIOUS="${MIHOMO_BASE_DIR}/bin/mihomo.previous"
 MIHOMO_UPGRADE_LOCK_DIR="${HOME}/.cache/clash-for-lab/mihomo-operation.lock"
 _UPGRADE_LOCK_METHOD=''
+_UPGRADE_LOCK_HELD=''
+_UPGRADE_LOCK_PATH=''
 
 _upgrade_info() {
     if command -v _okcat >/dev/null 2>&1; then
@@ -444,6 +446,19 @@ _upgrade_acquire_lock() {
     mkdir -p "$parent" || return 1
 
     if [ "$_UPGRADE_LOCK_METHOD" = flock ]; then
+        # If the lock path changed (e.g. a new test case), the old FD
+        # and lock are stale.  Close FD 9 and reset state so the new
+        # path can be acquired cleanly.
+        if [ -n "$_UPGRADE_LOCK_HELD" ] && [ "$_UPGRADE_LOCK_PATH" != "$MIHOMO_UPGRADE_LOCK_DIR" ]; then
+            flock -u 9 2>/dev/null || true
+            exec 9>&- 2>/dev/null || true
+            _UPGRADE_LOCK_HELD=''
+            _UPGRADE_LOCK_METHOD=''
+        fi
+        # Refuse re-entrant acquisition within the same process.
+        # Do NOT clear _UPGRADE_LOCK_METHOD: the lock is still held
+        # and _upgrade_release_lock needs the method to release it.
+        [ -z "${_UPGRADE_LOCK_HELD:-}" ] || return 1
         owner_file="${MIHOMO_UPGRADE_LOCK_DIR}.owner"
         _upgrade_managed_file_ok "$MIHOMO_UPGRADE_LOCK_DIR" false false || return 1
         _upgrade_managed_file_ok "$owner_file" false false || return 1
@@ -457,7 +472,19 @@ _upgrade_acquire_lock() {
             _UPGRADE_LOCK_METHOD=''
             return 1
         fi
+        _UPGRADE_LOCK_HELD=1
+        _UPGRADE_LOCK_PATH=$MIHOMO_UPGRADE_LOCK_DIR
     else
+        # If the lock path changed, reset stale mkdir lock state.
+        if [ -n "$_UPGRADE_LOCK_HELD" ] && [ "$_UPGRADE_LOCK_PATH" != "$MIHOMO_UPGRADE_LOCK_DIR" ]; then
+            local old_lock_dir="${_UPGRADE_LOCK_PATH}.d"
+            rm -f "${old_lock_dir}/owner" 2>/dev/null || true
+            rmdir "$old_lock_dir" 2>/dev/null || true
+            exec 9>&- 2>/dev/null || true
+            _UPGRADE_LOCK_HELD=''
+        fi
+        # Refuse re-entrant acquisition within the same process.
+        [ -z "${_UPGRADE_LOCK_HELD:-}" ] || return 1
         _UPGRADE_LOCK_METHOD=mkdir
         local lock_dir="${MIHOMO_UPGRADE_LOCK_DIR}.d"
         _upgrade_managed_file_ok "$lock_dir" false false || return 1
@@ -481,6 +508,8 @@ _upgrade_acquire_lock() {
         chmod 0700 "$lock_dir" 2>/dev/null || true
         exec 9>/dev/null || return 1
         owner_file="${lock_dir}/owner"
+        _UPGRADE_LOCK_HELD=1
+        _UPGRADE_LOCK_PATH=$MIHOMO_UPGRADE_LOCK_DIR
     fi
 
     owner=$(sh -c 'printf "%s\n" "$PPID"') || {
@@ -500,6 +529,7 @@ _upgrade_acquire_lock() {
 }
 
 _upgrade_release_lock() {
+    _UPGRADE_LOCK_HELD=''
     if [ "${_UPGRADE_LOCK_METHOD:-}" = mkdir ]; then
         local lock_dir="${MIHOMO_UPGRADE_LOCK_DIR}.d"
         local owner_file="${lock_dir}/owner"
